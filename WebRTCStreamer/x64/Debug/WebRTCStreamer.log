@@ -1,0 +1,87 @@
+﻿  Logger.cpp
+P:\Unity\WebRTCStreamer\Logger.cpp(1252,12): warning C4456: declaration of 'j' hides previous local declaration
+      P:\Unity\WebRTCStreamer\Logger.cpp(1243,10):
+      see declaration of 'j'
+  
+P:\Unity\WebRTCStreamer\Logger.cpp(1203,75): warning C4100: 'port': unreferenced formal parameter
+P:\Unity\WebRTCStreamer\Logger.cpp(1203,36): warning C4100: 'host': unreferenced formal parameter
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\xutility(506,82): warning C4244: 'argument': conversion from '_Ty' to 'uint8_t', possible loss of data
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\xutility(506,82): warning C4244:         with
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\xutility(506,82): warning C4244:         [
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\xutility(506,82): warning C4244:             _Ty=int
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\xutility(506,82): warning C4244:         ]
+  (compiling source file 'Logger.cpp')
+      C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\xutility(506,82):
+      the template instantiation context (the oldest one first) is
+          P:\Unity\WebRTCStreamer\Logger.cpp(1668,22):
+          see reference to function template instantiation 'std::shared_ptr<rtc::RtpPacketizationConfig> std::make_shared<rtc::RtpPacketizationConfig,const rtc::SSRC&,const char(&)[7],int&,int,int>(const rtc::SSRC &,const char (&)[7],int &,int &&,int &&)' being compiled
+          C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\memory(2903,46):
+          see reference to function template instantiation 'std::_Ref_count_obj2<rtc::RtpPacketizationConfig>::_Ref_count_obj2<const rtc::SSRC&,const char(&)[7],int&,_Ty,_Ty>(const rtc::SSRC &,const char (&)[7],int &,_Ty &&,_Ty &&)' being compiled
+          with
+          [
+              _Ty=int
+          ]
+          C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\memory(2092,18):
+          see reference to function template instantiation 'void std::_Construct_in_place<_Ty,const rtc::SSRC&,const char(&)[7],int&,int,int>(_Ty &,const rtc::SSRC &,const char (&)[7],int &,int &&,int &&) noexcept(false)' being compiled
+          with
+          [
+              _Ty=rtc::RtpPacketizationConfig
+          ]
+  
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\xutility(506,82): warning C4244: 'argument': conversion from 'int' to 'uint8_t', possible loss of data
+  (compiling source file 'Logger.cpp')
+  
+P:\Unity\WebRTCStreamer\Logger.cpp(263,25): warning C4505: 'ParseAnnexB': unreferenced function with internal linkage has been removed
+P:\Unity\WebRTCStreamer\Logger.cpp(290,38): warning C4505: 'SplitAccessUnits': unreferenced function with internal linkage has been removed
+  NvencD3D11.cpp
+P:\Unity\WebRTCStreamer\NvencD3D11.cpp(305,66): warning C4100: 'pts100ns': unreferenced formal parameter
+  Generating Code...
+ixwebsocket.lib(IXWebSocket.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXWebSocket.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXWebSocketCloseConstants.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXWebSocketCloseConstants.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXStrCaseCompare.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXStrCaseCompare.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXWebSocketPerMessageDeflateOptions.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXWebSocketPerMessageDeflateOptions.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXWebSocketTransport.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXWebSocketTransport.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXExponentialBackoff.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXExponentialBackoff.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXSetThreadName.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXSetThreadName.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXSocket.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXSocket.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXWebSocketPerMessageDeflate.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXWebSocketPerMessageDeflate.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXWebSocketHandshake.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXWebSocketHandshake.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXSocketFactory.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXSocketFactory.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXUrlParser.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXUrlParser.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXSelectInterrupt.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXSelectInterrupt.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXNetSystem.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXNetSystem.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXSelectInterruptFactory.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXSelectInterruptFactory.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXSocketConnect.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXSocketConnect.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXWebSocketPerMessageDeflateCodec.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXWebSocketPerMessageDeflateCodec.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXCancellationRequest.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXCancellationRequest.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXWebSocketHttpHeaders.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXWebSocketHttpHeaders.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXHttp.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXHttp.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXUserAgent.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXUserAgent.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXSelectInterruptEvent.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXSelectInterruptEvent.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+ixwebsocket.lib(IXDNSLookup.obj) : error LNK2038: mismatch detected for '_ITERATOR_DEBUG_LEVEL': value '0' doesn't match value '2' in Logger.obj
+ixwebsocket.lib(IXDNSLookup.obj) : error LNK2038: mismatch detected for 'RuntimeLibrary': value 'MD_DynamicRelease' doesn't match value 'MDd_DynamicDebug' in Logger.obj
+     Creating library P:\Unity\WebRTCStreamer\x64\Debug\WebRTCStreamer.lib and object P:\Unity\WebRTCStreamer\x64\Debug\WebRTCStreamer.exp
+LINK : warning LNK4098: defaultlib 'MSVCRT' conflicts with use of other libs; use /NODEFAULTLIB:library
+P:\Unity\WebRTCStreamer\x64\Debug\WebRTCStreamer.dll : fatal error LNK1319: 46 mismatches detected

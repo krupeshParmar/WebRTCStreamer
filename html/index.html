@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Unity WebRTC Control</title>
+  <style>
+    html, body { margin:0; height:100%; background:#0b0b0b; color:#ddd; font:14px/1.4 system-ui, sans-serif; }
+    .wrap { display:grid; place-items:center; height:100%; gap:12px; }
+    video { width: min(100vw, 100vh * 16/9); height: auto; background:#000; border-radius:12px; }
+    .row { display:flex; gap:8px; align-items:center; }
+    .pill { padding:6px 10px; border-radius:999px; background:#1c1c1c; color:#9ad; }
+    button { padding:8px 12px; border-radius:8px; background:#2a2a2a; color:#eee; border:1px solid #3a3a3a; cursor:pointer; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+  </style>
+</head>
+<body>
+  <h1>Unity WebRTC Control Panel</h1>
+    <h3>Logs from Unity:</h3>
+  <textarea id="logOutput" rows="10" cols="80"></textarea><br>
+  <button id="sendCommand">Send Command: toggleShader</button> 
+    <div class="wrap">
+    <video id="unity" autoplay playsinline muted controls></video>
+      <div class="row">
+       <span id="wsStatus" class="pill">WS: …</span>
+       <span id="pcStatus" class="pill">PC: …</span>
+       <button id="btnStart">Start</button>
+      </div>
+    </div>
+  <script src="webrtc.js"></script>
+</body>
+</html>
