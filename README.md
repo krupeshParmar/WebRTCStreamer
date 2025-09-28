@@ -59,6 +59,11 @@ Requirements
 
 - Visual Studio (C++17 or higher) for building the DLL.
 
+- libdatachannel
+ (clone and build; link the compiled library + headers to your Visual Studio project).
+
+- NVIDIA NVENC SDK (for GPU video encoding).
+
 - Node.js vXX for the signaling server.
 
 - Windows 10/11 + NVIDIA GPU (for NVENC).
