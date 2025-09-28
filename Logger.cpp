@@ -73,6 +73,8 @@ static std::vector<uint8_t> gSPS, gPPS;   // cached latest SPS/PPS from NVENC
 
 static uint32_t gSSRC = 0;
 
+static std::shared_ptr<rtc::H264RtpPacketizer> h264Packetizer;
+
 static uint32_t MakeRandomSSRC() {
 	static std::mt19937 rng{ std::random_device{}() };
 	static std::uniform_int_distribution<uint32_t> dist(1, 0xFFFFFFFFu);
@@ -151,7 +153,9 @@ void LogMessage(std::string msg) {
 
 static void NvEncBridgeLogger(const char* msg) { LogMessage(msg); }
 static void OnEncodedFrame(const uint8_t* data, int bytes, uint64_t pts90k, bool key);
-
+static inline uint32_t be32(const uint8_t* p) {
+	return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+}
 //static std::unique_ptr<H264RTPSender> rtpSender = nullptr;
 using ByteVec = std::vector<uint8_t>;
 struct H264_Frame
@@ -212,63 +216,108 @@ private:
 	void run() {
 		using namespace std::chrono;
 		const auto frameDur = duration<double>(1.0 / double(targetFps));
+		auto nextSend = steady_clock::now(); // start now
 
 		size_t sent = 0;
 		auto lastLog = steady_clock::now();
 
 		while (running) {
-			std::unique_lock<std::mutex> lk(m);
-			cv.wait_until(lk, nextSend, [this] { return !running || hasFrame; });
-			if (!running) break;
-
-			auto now = steady_clock::now();
-			if (now < nextSend) {
-				continue;
-			}
+			// Sleep until it's time to send. Do NOT hold the lock while sleeping.
+			std::this_thread::sleep_until(nextSend);
 
 			H264_Frame frame;
-			if (hasFrame) {
-				frame.bytevec.swap(latest.bytevec);
-				hasFrame = false;
+			{
+				std::lock_guard<std::mutex> lk(m);
+				if (!running) break;
+
+				// Drop if nothing fresh; don’t stall.
+				if (hasFrame) {
+					frame.bytevec.swap(latest.bytevec);
+					hasFrame = false;
+				}
 			}
-			lk.unlock();
 
 			if (!frame.bytevec.empty()) {
-				//rtpSender->sendAccessUnit(frame.bytevec/*, frame.bytevec.size(), frame.ts90k*/);
-				//++sent;
-				
-				// Send via libdatachannel track; packetizer must be attached once at setup.
 				rtc::binary bin(frame.bytevec.size());
 				std::transform(frame.bytevec.begin(), frame.bytevec.end(), bin.begin(),
 					[](uint8_t c) { return std::byte(c); });
 
-				bool ok = track && track->send(bin);
-				if (!ok) {
-					LogMessage("[Pacer] track->send() failed");
-				}
-				else {
-					++sent;
-				}
-			}
-			else {
-				
+				if (track && track->send(bin)) ++sent;
+				else LogMessage("[Pacer] track->send() failed");
 			}
 
+			// Advance schedule; if we’re behind, reset to now (drop latency, don’t chase backlog)
 			nextSend += duration_cast<steady_clock::duration>(frameDur);
-
-			now = steady_clock::now();
-			if (nextSend < now - milliseconds(5)) {
-				nextSend = now + duration_cast<steady_clock::duration>(frameDur);
-			}
+			auto now = steady_clock::now();
+			if (now - nextSend > frameDur) nextSend = now;
 
 			if (now - lastLog >= seconds(1)) {
-				LogMessage("[Pacer] fps=" + std::to_string(sent) +
-					" queue=" + std::to_string(hasFrame ? 1 : 0));
+				LogMessage("[Pacer] fps=" + std::to_string(sent) + " queue=" + std::to_string(hasFrame ? 1 : 0));
 				sent = 0;
 				lastLog = now;
 			}
 		}
 	}
+	//void run() {
+	//	using namespace std::chrono;
+	//	const auto frameDur = duration<double>(1.0 / double(targetFps));
+	//
+	//	size_t sent = 0;
+	//	auto lastLog = steady_clock::now();
+	//
+	//	while (running) {
+	//		std::unique_lock<std::mutex> lk(m);
+	//		cv.wait_until(lk, nextSend, [this] { return !running || hasFrame; });
+	//		if (!running) break;
+	//
+	//		auto now = steady_clock::now();
+	//		if (now < nextSend) {
+	//			continue;
+	//		}
+	//
+	//		H264_Frame frame;
+	//		if (hasFrame) {
+	//			frame.bytevec.swap(latest.bytevec);
+	//			hasFrame = false;
+	//		}
+	//		lk.unlock();
+	//
+	//		if (!frame.bytevec.empty()) {
+	//			//rtpSender->sendAccessUnit(frame.bytevec/*, frame.bytevec.size(), frame.ts90k*/);
+	//			//++sent;
+	//			
+	//			// Send via libdatachannel track; packetizer must be attached once at setup.
+	//			rtc::binary bin(frame.bytevec.size());
+	//			std::transform(frame.bytevec.begin(), frame.bytevec.end(), bin.begin(),
+	//				[](uint8_t c) { return std::byte(c); });
+	//
+	//			bool ok = track && track->send(bin);
+	//			if (!ok) {
+	//				LogMessage("[Pacer] track->send() failed");
+	//			}
+	//			else {
+	//				++sent;
+	//			}
+	//		}
+	//		else {
+	//			
+	//		}
+	//
+	//		nextSend += duration_cast<steady_clock::duration>(frameDur);
+	//
+	//		now = steady_clock::now();
+	//		if (nextSend < now - milliseconds(5)) {
+	//			nextSend = now + duration_cast<steady_clock::duration>(frameDur);
+	//		}
+	//
+	//		if (now - lastLog >= seconds(1)) {
+	//			LogMessage("[Pacer] fps=" + std::to_string(sent) +
+	//				" queue=" + std::to_string(hasFrame ? 1 : 0));
+	//			sent = 0;
+	//			lastLog = now;
+	//		}
+	//	}
+	//}
 };
 SimplePacer gPacer;
 
@@ -686,13 +735,9 @@ static uint32_t ParseVideoSsrcFromOffer(const std::string& sdp)
 	return ssrc;
 }
 
-inline bool containsIDR(const uint8_t* data, size_t size,
-	bool* outHasSPS = nullptr,
-	bool* outHasPPS = nullptr)
+inline bool containsNalType(const uint8_t* data, size_t size, uint8_t type)
 {
 	if (!data || size < 1) return false;
-	if (outHasSPS) *outHasSPS = false;
-	if (outHasPPS) *outHasPPS = false;
 
 	auto read_u32_be = [](const uint8_t* p) -> uint32_t {
 		return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
@@ -726,10 +771,8 @@ inline bool containsIDR(const uint8_t* data, size_t size,
 				}
 				if (nal_start < size) {
 					uint8_t nal_hdr = data[nal_start];
-					uint8_t nal_type = nal_hdr & 0x1F; // H.264
-					if (nal_type == 7 && outHasSPS) *outHasSPS = true;	// SPS
-					if (nal_type == 8 && outHasPPS) *outHasPPS = true;	// PPS
-					if (nal_type == 5) return true;						// IDR
+					uint8_t nal_type = nal_hdr & 0x1F;		// H.264
+					if (nal_type == type) return true;		// IDR
 				}
 				i = k;
 			}
@@ -747,9 +790,7 @@ inline bool containsIDR(const uint8_t* data, size_t size,
 			if (nal_len == 0 || pos + nal_len > size) break;
 			uint8_t nal_hdr = data[pos];
 			uint8_t nal_type = nal_hdr & 0x1F;
-			if (nal_type == 7 && outHasSPS) *outHasSPS = true;
-			if (nal_type == 8 && outHasPPS) *outHasPPS = true;
-			if (nal_type == 5) return true;
+			if (nal_type == type) return true;
 			pos += nal_len;
 		}
 		return false;
@@ -780,7 +821,7 @@ static bool AU_HasIDR(const uint8_t* p, size_t n) {
 	}
 	return false;
 }
-
+std::atomic<bool> haveKeyframe{ false };
 static void OnEncodedFrame(const uint8_t* data, int bytes, uint64_t pts100ns, bool key)
 {
 	if (!IsVideoReady()) {
@@ -791,6 +832,19 @@ static void OnEncodedFrame(const uint8_t* data, int bytes, uint64_t pts100ns, bo
 	}
 	if (!data || bytes <= 0) return;
 	//-----1----------
+
+	if (!haveKeyframe) {
+		bool isIDR = containsNalType(data, bytes, 5);   // parse Annex-B, look for NAL type 5
+		bool hasSPS = containsNalType(data, bytes, 7);
+		bool hasPPS = containsNalType(data, bytes, 8);
+		if (!(isIDR && (hasSPS || hasPPS))) {
+			// Drop pre-roll P/B frames; decoder can’t use them
+			return;
+		}
+		haveKeyframe = true;
+		//gPacer.start(gV_FPS);
+	}
+
 	ByteVec au(bytes);
 	std::memcpy(au.data(), data, bytes);
 	bool idrInAu = AU_HasIDR(au.data(), au.size());
@@ -798,7 +852,14 @@ static void OnEncodedFrame(const uint8_t* data, int bytes, uint64_t pts100ns, bo
 		" bytes=" + std::to_string(bytes));
 	const uint32_t ts90k = static_cast<uint32_t>((pts100ns * 9) / 1000);
 
-	gPacer.push(std::move(au), key, ts90k);
+	rtc::binary bin(au.size());
+	std::transform(au.begin(), au.end(), bin.begin(),
+		[](uint8_t c) { return std::byte(c); });
+	h264Packetizer->rtpConfig->timestamp = ts90k;;
+
+	if (!gVideoTrack || !gVideoTrack->send(bin)) LogMessage("[Video] Error sending video packets");
+
+	//gPacer.push(std::move(au), key, ts90k);
 	//-----1----------
 }
 
@@ -811,12 +872,15 @@ WEBRTC_STREAMER_API bool NWR_AddH264VideoMLine(int payloadType /* e.g., 96 */)
 		std::stringstream os;
 		os << "[Video] Description set: Width=" << gV_W << "Height=" << gV_H << "FPS=" << gV_FPS << "Bitrate=" << gV_BR;
 		LogMessage(os.str());
+
 		video.setBitrate(3000000);
 		video.addH264Codec(payloadType);
 		video.addAttribute("framerate");
 		gVideoTrack = peer_connection->addTrack(video);
+
 		gSSRC = MakeRandomSSRC();
 		const rtc::SSRC ssrc = gSSRC;
+
 		auto rtpCfg = std::make_shared<rtc::RtpPacketizationConfig>(
 			ssrc,                          
 			"webrtc",                      
@@ -824,14 +888,15 @@ WEBRTC_STREAMER_API bool NWR_AddH264VideoMLine(int payloadType /* e.g., 96 */)
 			/*clockRate*/ 90000,           
 			/*videoOrientationId*/ 0       
 		);
-		auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
+
+		h264Packetizer = std::make_shared<rtc::H264RtpPacketizer>(
 			rtc::NalUnit::Separator::StartSequence,
 			rtpCfg,
 			/*maxFragmentSize*/ 1200
 		);
-		gVideoTrack->setMediaHandler(packetizer);
+		gVideoTrack->setMediaHandler(h264Packetizer);
 		gPacer.track = gVideoTrack;
-		gPacer.start(gV_FPS);
+		//gPacer.start(gV_FPS);
 		//rtpSender->setSSRC(gSSRC);
 		LogMessage("[WebRTC][DLL] Using SSRC 0x" + /* print hex */ [](uint32_t s) {
 			std::ostringstream o; o << std::hex << std::uppercase << s; return o.str(); }(gSSRC));

@@ -33,17 +33,17 @@ pc.ontrack = (e) => {
   videoEl.play().catch(()=>{});
 };
 
-//setInterval(() => {
-//        console.log('Video state:', {
-//            readyState: videoEl.readyState,
-//            currentTime: videoEl.currentTime,
-//            buffered: videoEl.buffered.length,
-//            videoWidth: videoEl.videoWidth,
-//            videoHeight: videoEl.videoHeight,
-//            paused: videoEl.paused,
-//            ended: videoEl.ended
-//        });
-//    }, 2000);
+setInterval(() => {
+        console.log('Video state:', {
+            readyState: videoEl.readyState,
+            currentTime: videoEl.currentTime,
+            buffered: videoEl.buffered.length,
+            videoWidth: videoEl.videoWidth,
+            videoHeight: videoEl.videoHeight,
+            paused: videoEl.paused,
+            ended: videoEl.ended
+        });
+    }, 2000);
 
 //     // Force video to play
 //    videoEl.play().catch(e => console.log('Play failed:', e));
