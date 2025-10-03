@@ -1,45 +1,8 @@
-﻿  Logger.cpp
-P:\Unity\WebRTCStreamer\Logger.cpp(219,8): warning C4458: declaration of 'nextSend' hides class member
-      P:\Unity\WebRTCStreamer\Logger.cpp(177,40):
-      see declaration of 'SimplePacer::nextSend'
-  
-P:\Unity\WebRTCStreamer\Logger.cpp(610,12): warning C4456: declaration of 'j' hides previous local declaration
-      P:\Unity\WebRTCStreamer\Logger.cpp(601,10):
-      see declaration of 'j'
-  
-P:\Unity\WebRTCStreamer\Logger.cpp(561,75): warning C4100: 'port': unreferenced formal parameter
-P:\Unity\WebRTCStreamer\Logger.cpp(561,36): warning C4100: 'host': unreferenced formal parameter
-P:\Unity\WebRTCStreamer\Logger.cpp(825,84): warning C4100: 'key': unreferenced formal parameter
-C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\xutility(506,82): warning C4244: 'argument': conversion from '_Ty' to 'uint8_t', possible loss of data
-C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\xutility(506,82): warning C4244:         with
-C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\xutility(506,82): warning C4244:         [
-C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\xutility(506,82): warning C4244:             _Ty=int
-C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\xutility(506,82): warning C4244:         ]
-  (compiling source file 'Logger.cpp')
-      C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\xutility(506,82):
-      the template instantiation context (the oldest one first) is
-          P:\Unity\WebRTCStreamer\Logger.cpp(884,22):
-          see reference to function template instantiation 'std::shared_ptr<rtc::RtpPacketizationConfig> std::make_shared<rtc::RtpPacketizationConfig,const rtc::SSRC&,const char(&)[7],int&,int,int>(const rtc::SSRC &,const char (&)[7],int &,int &&,int &&)' being compiled
-          C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\memory(2903,46):
-          see reference to function template instantiation 'std::_Ref_count_obj2<rtc::RtpPacketizationConfig>::_Ref_count_obj2<const rtc::SSRC&,const char(&)[7],int&,_Ty,_Ty>(const rtc::SSRC &,const char (&)[7],int &,_Ty &&,_Ty &&)' being compiled
-          with
-          [
-              _Ty=int
-          ]
-          C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\memory(2092,18):
-          see reference to function template instantiation 'void std::_Construct_in_place<_Ty,const rtc::SSRC&,const char(&)[7],int&,int,int>(_Ty &,const rtc::SSRC &,const char (&)[7],int &,int &&,int &&) noexcept(false)' being compiled
-          with
-          [
-              _Ty=rtc::RtpPacketizationConfig
-          ]
-  
-C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.43.34808\include\xutility(506,82): warning C4244: 'argument': conversion from 'int' to 'uint8_t', possible loss of data
-  (compiling source file 'Logger.cpp')
-  
+﻿  NvencD3D11.cpp
      Creating library P:\Unity\WebRTCStreamer\x64\Release\WebRTCStreamer.lib and object P:\Unity\WebRTCStreamer\x64\Release\WebRTCStreamer.exp
   Generating code
-  50 of 2958 functions ( 1.7%) were compiled, the rest were copied from previous compilation.
-    11 functions were new in current compilation
-    13 functions had inline decision re-evaluated but remain unchanged
+  57 of 2936 functions ( 1.9%) were compiled, the rest were copied from previous compilation.
+    6 functions were new in current compilation
+    90 functions had inline decision re-evaluated but remain unchanged
   Finished generating code
   WebRTCStreamer.vcxproj -> P:\Unity\WebRTCStreamer\x64\Release\WebRTCStreamer.dll

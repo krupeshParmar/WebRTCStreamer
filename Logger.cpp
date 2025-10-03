@@ -319,7 +319,7 @@ private:
 	//	}
 	//}
 };
-SimplePacer gPacer;
+//SimplePacer gPacer;
 
 
 static inline rtc::binary ToBinary(const uint8_t* data, size_t len) {
@@ -855,7 +855,7 @@ static void OnEncodedFrame(const uint8_t* data, int bytes, uint64_t pts100ns, bo
 	rtc::binary bin(au.size());
 	std::transform(au.begin(), au.end(), bin.begin(),
 		[](uint8_t c) { return std::byte(c); });
-	h264Packetizer->rtpConfig->timestamp = ts90k;;
+	h264Packetizer->rtpConfig->timestamp = ts90k;
 
 	if (!gVideoTrack || !gVideoTrack->send(bin)) LogMessage("[Video] Error sending video packets");
 
@@ -865,15 +865,20 @@ static void OnEncodedFrame(const uint8_t* data, int bytes, uint64_t pts100ns, bo
 
 WEBRTC_STREAMER_API bool NWR_AddH264VideoMLine(int payloadType /* e.g., 96 */)
 {
+	NvencServerConfig* serverConfig = GetNvencServerConfig();
 	try {
 		gPT = uint8_t(payloadType);
 		rtc::Description::Video video("video", rtc::Description::Direction::SendOnly);
 		NWR_GetVideoDesc(&gV_W, &gV_H, &gV_FPS, &gV_BR);
+		gV_W = serverConfig->width;
+		gV_H = serverConfig->height;
+		gV_FPS = serverConfig->fpsNum;
+		gV_BR = serverConfig->bitrateKbps;
 		std::stringstream os;
 		os << "[Video] Description set: Width=" << gV_W << "Height=" << gV_H << "FPS=" << gV_FPS << "Bitrate=" << gV_BR;
 		LogMessage(os.str());
 
-		video.setBitrate(3000000);
+		video.setBitrate(gV_BR);
 		video.addH264Codec(payloadType);
 		video.addAttribute("framerate");
 		gVideoTrack = peer_connection->addTrack(video);
@@ -885,26 +890,22 @@ WEBRTC_STREAMER_API bool NWR_AddH264VideoMLine(int payloadType /* e.g., 96 */)
 			ssrc,                          
 			"webrtc",                      
 			/*payloadType*/ payloadType,   
-			/*clockRate*/ 90000,           
+			/*clockRate*/ serverConfig->clockRateHz,           
 			/*videoOrientationId*/ 0       
 		);
-
+		rtpCfg->startTimestamp = serverConfig->startTimestamp;
 		h264Packetizer = std::make_shared<rtc::H264RtpPacketizer>(
 			rtc::NalUnit::Separator::StartSequence,
 			rtpCfg,
 			/*maxFragmentSize*/ 1200
 		);
 		gVideoTrack->setMediaHandler(h264Packetizer);
-		gPacer.track = gVideoTrack;
-		//gPacer.start(gV_FPS);
-		//rtpSender->setSSRC(gSSRC);
 		LogMessage("[WebRTC][DLL] Using SSRC 0x" + /* print hex */ [](uint32_t s) {
 			std::ostringstream o; o << std::hex << std::uppercase << s; return o.str(); }(gSSRC));
 		if (gVideoTrack) {
 			gVideoTrack->onOpen([]() 
 				{
 					gVideoReady = true;
-					//StartPacer();
 					LogMessage("[NVENC] Video track OPEN"); 
 				});
 			gVideoTrack->onError([](std::string e) 
@@ -974,10 +975,9 @@ void NWR_DestroyPeer()
 	try {
 		// stop NVENC first (flushes & releases)
 		Nvenc_Close();
-		gPacer.stop();
-		//StopPacer();
 		// drop video track
 		if (gVideoTrack) {
+			h264Packetizer.reset();
 			gVideoTrack->close();
 			gVideoTrack.reset();
 		}

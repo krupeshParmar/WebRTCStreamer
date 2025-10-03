@@ -3,7 +3,7 @@
 #pragma once
 #include <cstdint>
 #include <vector>
-
+#include "NvencServerConfig.h"
 #include "IUnityInterface.h"
 struct ID3D11Device;
 struct ID3D11Texture2D;
@@ -14,13 +14,15 @@ struct ID3D11Texture2D;
 #define NVWR_API extern "C"
 #endif
 
+NvencServerConfig* GetNvencServerConfig();
+
 typedef void (*NvencLogCB)(const char* msg);
 NVWR_API void Nvenc_SetLogger(NvencLogCB cb);
 
 typedef void (*NvencEncodedFrameSink)(const uint8_t* annexB, int bytes, uint64_t pts90k, bool keyframe);
 NVWR_API void Nvenc_SetEncodedFrameSink(NvencEncodedFrameSink cb);
 
-NVWR_API bool Nvenc_Open(ID3D11Device* dev, int w, int h, int fps, int bitrateKbps);
+NVWR_API bool Nvenc_Open(ID3D11Device* dev);
 NVWR_API bool Nvenc_EncodeTexture(ID3D11Texture2D* tex,
 	std::uint64_t pts100ns,
 	std::vector<std::uint8_t>& outAnnexB,
@@ -43,4 +45,4 @@ NVWR_API void* NWR_GetD3D11Device();
 NVWR_API void NWR_SetPendingPTS(long long pts100ns);
 NVWR_API void UNITY_INTERFACE_API NWR_OnRenderEvent(int eventId, void* data);
 NVWR_API UnityRenderingEventAndData NWR_GetRenderEventFunc();
-NVWR_API bool NWR_InitVideoWithD3D11Device(void* d3d11Device, int width, int height, int fps, int bitrateKbps, bool saveLocally);
+NVWR_API bool NWR_InitVideoWithD3D11Device(void* d3d11Device, NvencServerConfig serverConfig, bool saveLocally);

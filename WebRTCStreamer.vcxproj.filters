@@ -7,6 +7,7 @@
   <ItemGroup>
     <ClInclude Include="Common.h" />
     <ClInclude Include="NvencD3D11.h" />
+    <ClInclude Include="NvencServerConfig.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />

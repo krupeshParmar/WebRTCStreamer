@@ -26,6 +26,7 @@ static IUnityGraphics* s_GFX = nullptr;
 static ID3D11Device* s_D3D11 = nullptr;
 static ID3D11Texture2D* gLastTex = nullptr;
 static bool s_SaveLocally = true;
+static NvencServerConfig s_ServerConfig;
 
 
 // Called when the plugin is loaded by Unity
@@ -59,6 +60,11 @@ static inline void NVENC_LOG(const char* where, NVENCSTATUS st) {
     char buf[256];
     std::snprintf(buf, sizeof(buf), "[NVENC] %s failed: 0x%08x", where, st);
     Log(buf);
+}
+
+NvencServerConfig* GetNvencServerConfig()
+{
+    return &s_ServerConfig;
 }
 
 NVWR_API void Nvenc_SetLogger(NvencLogCB cb) { g_log = cb; }
@@ -186,10 +192,10 @@ void NvencD3D11::getParamsForPreset() {
 
     cfg = pc.presetCfg; // FIRST (once)
     cfg.profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;      
-    cfg.gopLength = FPS * 2;
+    cfg.gopLength = s_ServerConfig.gopLength;
     cfg.frameIntervalP = 1;                               
-    cfg.encodeCodecConfig.h264Config.idrPeriod = FPS;
-    cfg.encodeCodecConfig.h264Config.repeatSPSPPS = 1;    
+    cfg.encodeCodecConfig.h264Config.idrPeriod = s_ServerConfig.idrPeriod;
+    cfg.encodeCodecConfig.h264Config.repeatSPSPPS = s_ServerConfig.repeatSpsPps;
     cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
     cfg.rcParams.averageBitRate = Bitrate;
     cfg.rcParams.maxBitRate = Bitrate;
@@ -263,7 +269,8 @@ bool NvencD3D11::open(ID3D11Device* dev, int w, int h, int fps, int kbps) {
     init.presetGUID = NV_ENC_PRESET_P3_GUID; // low latency perf
     init.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
     init.encodeWidth = W; init.encodeHeight = H; init.darWidth = W; init.darHeight = H;
-    init.frameRateNum = FPS; init.frameRateDen = 1; init.enablePTD = 1; init.reportSliceOffsets = 0; init.enableSubFrameWrite = 0;
+    init.frameRateNum = FPS; init.frameRateDen = s_ServerConfig.fpsDen; 
+    init.enablePTD = 1; init.reportSliceOffsets = 0; init.enableSubFrameWrite = 0;
     init.encodeConfig = &cfg; 
     getParamsForPreset();
 
@@ -412,7 +419,7 @@ void NvencD3D11::setBitrate(int kbps) {
     cfg.rcParams.averageBitRate = Bitrate * 1000; 
     cfg.rcParams.maxBitRate = Bitrate * 1000;
     cfg.rcParams.vbvBufferSize = cfg.rcParams.averageBitRate / FPS;
-    cfg.rcParams.enableAQ = 0;
+    cfg.rcParams.enableAQ = s_ServerConfig.enableAQ;
     NV_ENC_RECONFIGURE_PARAMS rp{ NV_ENC_RECONFIGURE_PARAMS_VER }; 
     rp.reInitEncodeParams = init; 
     rp.reInitEncodeParams.encodeConfig = &cfg;
@@ -437,8 +444,8 @@ void NvencD3D11::GetVideoDesc(int* width, int* height, int* fps, int* bitratekbp
     *bitratekbps = Bitrate;
 }
 
-NVWR_API bool Nvenc_Open(ID3D11Device* dev, int w, int h, int fps, int bitrateKbps) {
-    try { return NvencD3D11::I().open(dev, w, h, fps, bitrateKbps); }
+NVWR_API bool Nvenc_Open(ID3D11Device* dev) {
+    try { return NvencD3D11::I().open(dev, s_ServerConfig.width, s_ServerConfig.height, s_ServerConfig.fpsNum, s_ServerConfig.bitrateKbps); }
     catch (...) { Log("[NVENC] open threw"); return false; }
 }
 NVWR_API bool Nvenc_EncodeTexture(ID3D11Texture2D* tex, std::uint64_t pts100ns,
@@ -476,8 +483,9 @@ NVWR_API void UNITY_INTERFACE_API NWR_OnRenderEvent(int eventId, void* data) {
 NVWR_API UnityRenderingEventAndData NWR_GetRenderEventFunc() { return &NWR_OnRenderEvent; }
 
 
-NVWR_API bool NWR_InitVideoWithD3D11Device(void* d3d11Device, int width, int height, int fps, int bitrateKbps, bool saveLocally) {
+NVWR_API bool NWR_InitVideoWithD3D11Device(void* d3d11Device, NvencServerConfig serverConfig, bool saveLocally) {
     s_SaveLocally = saveLocally;
-    return Nvenc_Open(reinterpret_cast<ID3D11Device*>(d3d11Device), width, height, fps, bitrateKbps);
+    s_ServerConfig = serverConfig;
+    return Nvenc_Open(reinterpret_cast<ID3D11Device*>(d3d11Device));
 }
 
