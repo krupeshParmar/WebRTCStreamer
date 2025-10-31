@@ -202,6 +202,12 @@ void NvencD3D11::getParamsForPreset() {
     cfg.rcParams.vbvBufferSize = Bitrate / 4;
     cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
 
+    // Explicit 1:1 SAR
+    //cfg.encodeCodecConfig.h264Config.h264VUIParameters.aspectRatioIdc = NV_ENC_H264_ASPECT_RATIO_1_1;
+    //cfg.encodeCodecConfig.h264Config.h264VUIParameters.sarWidth = 1;
+    //cfg.encodeCodecConfig.h264Config.h264VUIParameters.sarHeight = 1;
+
+    cfg.encodeCodecConfig.h264Config.h264VUIParameters.videoFullRangeFlag = 1; // if you encode full-range
     /*
     cfg = pc.presetCfg; 
     cfg.version = NV_ENC_CONFIG_VER;

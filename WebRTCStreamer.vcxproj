@@ -13,6 +13,7 @@
   <ItemGroup>
     <ClCompile Include="Logger.cpp" />
     <ClCompile Include="NvencD3D11.cpp" />
+    <ClCompile Include="Streamer.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Common.h" />
@@ -87,7 +88,8 @@
       <PrecompiledHeaderFile>
       </PrecompiledHeaderFile>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>P:\Unity\NativeRenderingPlugin\PluginSource\source\Unity;$(SolutionDir)vendors\;P:\WebRTC\IXWebSocket;P:\WebRTC\libdatachannel\include;P:\Unity\WebRTCStreamer\packages\nvenc.12.2.72\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>E:\Unity\NativeRenderingPlugin\PluginSource\source\Unity;$(SolutionDir)vendors\;E:\WebRTC\IXWebSocket;E:\WebRTC\libdatachannel\install\include;E:\Unity\WebRTCStreamer\packages\nvenc.12.2.72\include</AdditionalIncludeDirectories>
+      <CompileAs>CompileAsCpp</CompileAs>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -96,7 +98,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
       <AdditionalDependencies>ixwebsocket.lib;ws2_32.lib;nvencodeapi.lib;datachannel.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(SolutionDir)vendors;P:\Unity\WebRTCStreamer\packages\nvenc.12.2.72\lib\x64;P:\WebRTC\libdatachannel\build\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(SolutionDir)vendors;E:\Unity\WebRTCStreamer\packages\nvenc.12.2.72\lib\x64;E:\WebRTC\libdatachannel\install\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

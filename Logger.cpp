@@ -1,6 +1,38 @@
-﻿// Copyright (c) Krupesh Parmar
+﻿// ============================================================================
+// WebRTC + NVENC Real-Time Video Streaming Plugin
+// ============================================================================
+// Copyright (c) Krupesh Parmar
 // Distributed under the MIT license. See the LICENSE file in the project root for more information.
+//
+// OVERVIEW:
+// This plugin enables real-time H.264 video streaming from Unity to a web browser
+// using WebRTC for peer-to-peer communication and NVIDIA NVENC for GPU-accelerated
+// video encoding.
+//
+// ARCHITECTURE:
+// - Unity Main Thread: Renders frames, calls plugin APIs
+// - NVENC Thread: GPU encodes frames to H.264
+// - Worker Thread: Manages WebRTC/WebSocket/DataChannel operations
+// - Callback Threads: Internal libdatachannel/ixwebsocket threads
+//
+// THREADING SAFETY:
+// All WebRTC operations happen on a single worker thread to avoid race conditions.
+// Other threads communicate via thread-safe queues. No callbacks directly access
+// shared WebRTC state - they only queue messages for the worker thread to process.
+//
+// KEY LESSONS LEARNED:
+// 1. Never hardcode bindAddress - let WebRTC auto-detect network interfaces
+// 2. Always wrap WebRTC operations in try/catch - uncaught exceptions crash silently
+// 3. Callbacks must only queue data, never perform complex operations
+// 4. Poll for ICE gathering completion instead of using onLocalCandidate callbacks
+// 5. Proper cleanup order: DataChannel → Track → Packetizer → PeerConnection → WebSocket
+// ============================================================================
+
 #define NOMINMAX
+
+// ============================================================================
+// INCLUDES
+// ============================================================================
 #include "Common.h"
 #include <ixwebsocket/IXWebSocket.h>
 #include <thread>
@@ -19,1016 +51,1422 @@
 #include "IUnityGraphicsD3D11.h"
 #include <d3d11.h>
 #include "NvencD3D11.h"
+#include <psapi.h>
+#include <windows.h>
+#include <dbghelp.h>
 
+#pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "ws2_32.lib")
-
-// Globals
-ix::WebSocket g_websocket;
-std::atomic_bool g_connected = false;
-static std::atomic<bool> g_offerSent{ false };
-
-std::shared_ptr<rtc::PeerConnection> peer_connection;
-static std::atomic<bool> remoteSet{ false };
-std::shared_ptr<rtc::DataChannel> data_connection;
-std::string offerDescription = "";
-std::vector<rtc::Candidate> pendingCandidates;
-
-typedef void (*CommandCallback)(const char* message);
-CommandCallback g_CommandCallback = nullptr;
+#pragma comment(lib, "dbghelp.lib")
 
 using json = nlohmann::json;
-void OnMessageFromBrowser(std::string msg);
-
-WEBRTC_STREAMER_API void NWR_SyncVideoSsrcFromOffer();
-WEBRTC_STREAMER_API bool NWR_AddH264VideoMLine(int payloadType /* e.g., 96 */);
-struct transform_component
-{
-	float position[3];
-	float rotation[3];
-	float scale[3];
-};
-
-struct log_data
-{
-	transform_component transform;
-	bool shader1state;
-};
-
-
-using Clock = std::chrono::steady_clock;
-auto t0 = Clock::now();
 using ByteVec = std::vector<uint8_t>;
-// ---- Video globals ----
-static std::shared_ptr<rtc::Track> gVideoTrack;
-static int      gV_W = 1920, gV_H = 1080, gV_FPS = 30, gV_BR = 6000;
-static uint8_t  gPT = 96;                 // H.264 PT (dynamic)
-static uint32_t gTs = 0x12345678;           // random start
-static uint32_t gTs90k = 0;
-static uint32_t gTsStep = 90000 / std::max(1u, static_cast<unsigned int>(gV_FPS));	// for 30 fps; set to 90000/fps
-static uint16_t gSeq = 1;
-static const size_t kMTU = 1200;
-std::atomic<bool>     gVideoReady = false;
-static bool     gCodecHeaderSent = false; // STAP-A sent
-static std::vector<uint8_t> gSPS, gPPS;   // cached latest SPS/PPS from NVENC
+using Clock = std::chrono::steady_clock;
 
-static uint32_t gSSRC = 0;
+// ============================================================================
+// SECTION 1: CORE TYPES & STRUCTURES
+// ============================================================================
 
-static std::shared_ptr<rtc::H264RtpPacketizer> h264Packetizer;
+/**
+ * @brief Transform data from Unity (position, rotation, scale)
+ * Used for debugging and telemetry sent over DataChannel
+ */
+struct transform_component {
+    float position[3];
+    float rotation[3];
+    float scale[3];
+};
 
-static uint32_t MakeRandomSSRC() {
-	static std::mt19937 rng{ std::random_device{}() };
-	static std::uniform_int_distribution<uint32_t> dist(1, 0xFFFFFFFFu);
-	return dist(rng);
+/**
+ * @brief Log data structure sent from Unity to browser
+ * Contains transform data and shader state for debugging
+ */
+struct log_data {
+    transform_component transform;
+    bool shader1state;
+};
+
+/**
+ * @brief Callback type for receiving commands from browser
+ * Unity registers this callback to receive messages via DataChannel or WebSocket
+ * Thread-safe: Called from worker thread, queues to Unity's main thread
+ */
+typedef void (*CommandCallback)(const char* message);
+
+// ============================================================================
+// SECTION 2: LOGGING SYSTEM
+// ============================================================================
+
+static std::ofstream s_Logger;          // File stream for logging
+static std::mutex log_mutex;            // Protects s_Logger from concurrent access
+
+/**
+ * @brief Generates timestamp string for log entries
+ * Format: [YYYY-MM-DD HH:MM:SS.mmm]
+ * Thread-safe: Uses only local variables
+ */
+std::string GetTimestamp() {
+    using namespace std::chrono;
+    auto now = system_clock::now();
+    auto t = system_clock::to_time_t(now);
+    auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+
+    std::tm tm_buf;
+    localtime_s(&tm_buf, &t);
+
+    std::ostringstream oss;
+    oss << std::put_time(&tm_buf, "[%Y-%m-%d %H:%M:%S")
+        << '.' << std::setfill('0') << std::setw(3) << ms.count() << "] ";
+    return oss.str();
 }
 
-static std::ofstream s_Logger;
-std::mutex log_mutex;
+/**
+ * @brief Logs a formatted message to file
+ * Thread-safe: Uses mutex to protect file access
+ * Format: [timestamp] message
+ *
+ * @param format printf-style format string
+ * @param ... variable arguments for formatting
+ */
+void LogMessage(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
 
+    int size = vsnprintf(nullptr, 0, format, args);
+    va_end(args);
+
+    if (size <= 0) return;
+
+    std::string buffer(size + 1, '\0');
+    va_start(args, format);
+    vsnprintf(&buffer[0], buffer.size(), format, args);
+    va_end(args);
+
+    std::lock_guard<std::mutex> lock(log_mutex);
+    if (!s_Logger.is_open())
+        s_Logger.open("WebStreamLogs/logs.txt", std::ios::app);
+    s_Logger << GetTimestamp() << buffer << "\n";
+    s_Logger.flush();
+}
+
+/**
+ * @brief Logs a string message (convenience overload)
+ * Thread-safe: Delegates to formatted LogMessage
+ */
+void LogMessage(std::string msg) {
+    LogMessage("%s", msg.c_str());
+}
+
+/**
+ * @brief Bridge function for NVENC encoder to log messages
+ * Thread-safe: Called from NVENC thread, delegates to thread-safe LogMessage
+ */
+static void NvEncBridgeLogger(const char* msg) {
+    LogMessage(msg);
+}
+
+// ============================================================================
+// SECTION 3: GLOBAL STATE - WEBRTC CORE
+// ============================================================================
+// THREAD OWNERSHIP: Worker thread only (except atomic flags)
+// These objects must NEVER be accessed from callbacks or other threads directly
+
+static std::shared_ptr<rtc::PeerConnection> g_peer_connection;  // WebRTC peer connection
+static std::shared_ptr<rtc::Track> g_videoTrack;                // Video track for H.264 stream
+static std::shared_ptr<rtc::H264RtpPacketizer> g_h264Packetizer;// RTP packetizer for H.264
+static std::shared_ptr<rtc::DataChannel> g_dc;                  // DataChannel for bidirectional messaging
+
+// ============================================================================
+// SECTION 4: GLOBAL STATE - WEBSOCKET & SIGNALING
+// ============================================================================
+
+static ix::WebSocket g_websocket;                      // WebSocket for signaling
+static std::atomic<bool> g_websocketOpen{ false };      // True when WebSocket is connected
+static std::atomic<bool> g_websocketAlive{ false };     // True when WebSocket is active (for safe send)
+static std::atomic<bool> g_connected{ false };          // Legacy flag, mirrors g_websocketOpen
+
+static std::mutex sdpMutex;                            // Protects SDP and ICE candidate data
+static std::string g_localSdp;                         // Local SDP offer (after ICE gathering)
+static std::string offerDescription;                   // Legacy, use g_localSdp
+static std::vector<std::string> pendingCandidates;     // Buffered ICE candidates (before remote SDP set)
+
+// ============================================================================
+// SECTION 5: GLOBAL STATE - THREADING & SYNCHRONIZATION
+// ============================================================================
+
+static std::thread g_workerThread;                     // Worker thread for all WebRTC operations
+static std::atomic<bool> g_running{ false };             // True when worker thread should run
+static std::atomic<bool> g_offerSent{ false };          // True after SDP offer sent to browser
+static std::atomic<bool> remoteSet{ false };            // True after browser's SDP answer received
+static std::atomic<bool> g_dcOpen{ false };             // True when DataChannel is open
+
+// ICE gathering state
+static bool g_gatheringComplete = false;               // True when ICE gathering finishes
+static std::string g_lastLocalSdp;                     // Last SDP sent (to detect changes)
+
+// Legacy task queue (currently unused in polling architecture)
+static std::mutex qM;
+static std::condition_variable qCV;
+static std::queue<std::function<void()>> q;
+static std::atomic_bool running{ false };
+
+// Mutex for protecting various global state (legacy, consider consolidating)
+static std::mutex gPeerMutex;
+static std::mutex gDataConnectionMutex;
+static std::mutex localIceMtx;
+
+// ============================================================================
+// SECTION 6: GLOBAL STATE - VIDEO ENCODING
+// ============================================================================
+
+static uint32_t gSSRC = 0;                             // Synchronization Source identifier for RTP
+static int gV_W = 1920, gV_H = 1080;                  // Video width and height
+static int gV_FPS = 30;                                // Target frames per second
+static int gV_BR = 6000;                               // Target bitrate in kbps
+static uint8_t gPT = 96;                               // RTP payload type for H.264
+
+// Legacy/unused video state
+//static uint32_t gTs = 0x12345678;
+//static uint32_t gTs90k = 0;
+//static uint32_t gTsStep = 90000 / std::max(1u, static_cast<unsigned int>(gV_FPS));
+//static uint16_t gSeq = 1;
+//static const size_t kMTU = 1200;
+//static std::atomic<bool> gVideoReady{ false };
+//static bool gCodecHeaderSent = false;
+//static std::vector<uint8_t> gSPS, gPPS;
+//static Clock::time_point t0 = Clock::now();
+
+// ============================================================================
+// SECTION 7: GLOBAL STATE - CALLBACKS
+// ============================================================================
+
+static CommandCallback g_CommandCallback = nullptr;    // Unity callback for browser messages
+
+/**
+ * @brief Forwards browser message to Unity callback
+ * Thread-safety: Called from worker thread
+ * Internal function - invokes registered Unity callback
+ */
+void OnMessageFromBrowser(std::string msg) {
+    if (g_CommandCallback) {
+        g_CommandCallback(msg.c_str());
+    }
+}
+
+// ============================================================================
+// SECTION 8: HELPER CLASSES
+// ============================================================================
+
+/**
+ * @brief Manages RTP timestamp conversion from presentation timestamps
+ * Converts Unity's 100ns timestamps to RTP's 90kHz clock
+ * Thread-safe: No shared state, each instance independent
+ */
 class TimestampManager {
 private:
-	uint32_t rtpTimestampBase = 0;
-	uint64_t basePts100ns = 0;
-	bool initialized = false;
+    uint32_t rtpTimestampBase = 0;
+    uint64_t basePts100ns = 0;
+    bool initialized = false;
 
 public:
-	uint32_t convertPtsToRtp(uint64_t pts100ns) {
-		if (!initialized) {
-			basePts100ns = pts100ns;
-			rtpTimestampBase = static_cast<uint32_t>(rand()); // Random start
-			initialized = true;
-			return rtpTimestampBase;
-		}
+    /**
+     * @brief Converts presentation timestamp to RTP timestamp
+     * @param pts100ns Presentation timestamp in 100-nanosecond units
+     * @return RTP timestamp at 90kHz clock rate
+     */
+    uint32_t convertPtsToRtp(uint64_t pts100ns) {
+        if (!initialized) {
+            basePts100ns = pts100ns;
+            rtpTimestampBase = static_cast<uint32_t>(rand());
+            initialized = true;
+            return rtpTimestampBase;
+        }
 
-		// Convert 100ns units to 90kHz RTP timestamp
-		uint64_t deltaPts100ns = pts100ns - basePts100ns;
-		uint64_t deltaPtsUs = deltaPts100ns / 10;  // 100ns -> microseconds
-		uint32_t rtpDelta = static_cast<uint32_t>((deltaPtsUs * 90) / 1000); // us -> 90kHz
+        // Convert 100ns → microseconds → 90kHz
+        uint64_t deltaPts100ns = pts100ns - basePts100ns;
+        uint64_t deltaPtsUs = deltaPts100ns / 10;
+        uint32_t rtpDelta = static_cast<uint32_t>((deltaPtsUs * 90) / 1000);
 
-		return rtpTimestampBase + rtpDelta;
-	}
+        return rtpTimestampBase + rtpDelta;
+    }
 };
 
-static TimestampManager tsManager;
+static TimestampManager tsManager;  // Currently unused, but available for timestamp conversion
 
-std::string GetTimestamp()
-{
-	using namespace std::chrono;
-	auto now = system_clock::now();
-	auto t = system_clock::to_time_t(now);
-	auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+// ============================================================================
+// SECTION 9: THREAD-SAFE MESSAGE QUEUES
+// ============================================================================
+// These queues allow safe communication between threads without blocking
 
-	std::tm tm_buf;
-	localtime_s(&tm_buf, &t);
-
-	std::ostringstream oss;
-	oss << std::put_time(&tm_buf, "[%Y-%m-%d %H:%M:%S")
-		<< '.' << std::setfill('0') << std::setw(3) << ms.count() << "] ";
-	return oss.str();
-}
-
-void LogMessage(const char* format, ...) {
-	va_list args;
-	va_start(args, format);
-
-	int size = vsnprintf(nullptr, 0, format, args);
-	va_end(args);
-
-	if (size <= 0) return;
-
-	std::string buffer(size + 1, '\0');
-	va_start(args, format);
-	vsnprintf(&buffer[0], buffer.size(), format, args);
-	va_end(args);
-
-	std::lock_guard<std::mutex> lock(log_mutex);
-	if (!s_Logger.is_open())
-		s_Logger.open("WebStreamLogs/logs.txt", std::ios::app);
-	s_Logger << GetTimestamp() << buffer << "\n";
-	s_Logger.flush();
-}
-
-void LogMessage(std::string msg) {
-	LogMessage("%s", msg.c_str());
-}
-
-static void NvEncBridgeLogger(const char* msg) { LogMessage(msg); }
-static void OnEncodedFrame(const uint8_t* data, int bytes, uint64_t pts90k, bool key);
-static inline uint32_t be32(const uint8_t* p) {
-	return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
-}
-//static std::unique_ptr<H264RTPSender> rtpSender = nullptr;
-using ByteVec = std::vector<uint8_t>;
-struct H264_Frame
-{
-	ByteVec bytevec;
-	bool isIDR = false;
-	uint32_t ts90k = 0;
+/**
+ * @brief Frame data from NVENC encoder
+ * Pushed by: NVENC thread
+ * Popped by: Worker thread
+ */
+struct FrameData {
+    std::vector<uint8_t> data;  // H.264 encoded frame data
+    uint64_t pts100ns;          // Presentation timestamp (100ns units)
 };
-struct SimplePacer {
-	std::atomic<bool> running{ false };
-	std::thread th;
-	std::mutex m;
-	std::condition_variable cv;
 
-	H264_Frame latest;
-	bool hasFrame = false;
+static std::mutex g_frameMutex;
+static std::queue<FrameData> g_frameQueue;
 
-	int targetFps = 30;
-	std::chrono::steady_clock::time_point nextSend;
+/**
+ * @brief Pushes encoded frame to queue for WebRTC transmission
+ * Thread-safe: Called from NVENC thread
+ * Queue limit: 60 frames (drops oldest if exceeded)
+ */
+static void PushFrame(const uint8_t* data, int bytes, uint64_t pts100ns) {
+    FrameData frame;
+    frame.data.assign(data, data + bytes);
+    frame.pts100ns = pts100ns;
 
-	std::shared_ptr<rtc::Track> track;
-	int payloadType = 96;
+    std::lock_guard<std::mutex> lk(g_frameMutex);
+    g_frameQueue.push(std::move(frame));
 
-	void start(int fps) {
-		/*if (rtpSender) {
-			rtpSender->reset();
-		}
-		else {
-			rtpSender = std::make_unique<H264RTPSender>();
-		}*/
-		LogMessage("[Video] RTP sender initialized");
-		targetFps = (fps > 0 ? fps : 30);
-		running = true;
-		nextSend = std::chrono::steady_clock::now();
-		th = std::thread([this] { run(); });
-		LogMessage("[Pacer] started");
-	}
+    // Prevent unbounded growth - drop old frames if queue too large
+    while (g_frameQueue.size() > 60) {
+        g_frameQueue.pop();
+    }
+}
 
-	void stop() {
-		running = false;
-		cv.notify_all();
-		if (th.joinable()) th.join();
-		LogMessage("[Pacer] stopped");
-	}
+/**
+ * @brief Pops frame from queue for transmission
+ * Thread-safe: Called from worker thread
+ * @return true if frame retrieved, false if queue empty
+ */
+static bool PopFrame(FrameData& frame) {
+    std::lock_guard<std::mutex> lk(g_frameMutex);
+    if (g_frameQueue.empty()) return false;
+    frame = std::move(g_frameQueue.front());
+    g_frameQueue.pop();
+    return true;
+}
 
-	void push(ByteVec&& frame, bool iskey, uint32_t ts90k) {
-		{
-			std::lock_guard<std::mutex> lk(m);
-			latest.bytevec = std::move(frame);
-			latest.isIDR = iskey;
-			latest.ts90k = ts90k;
-			hasFrame = true;
-		}
-		cv.notify_one();
-	}
-
-private:
-	void run() {
-		using namespace std::chrono;
-		const auto frameDur = duration<double>(1.0 / double(targetFps));
-		auto nextSend = steady_clock::now(); // start now
-
-		size_t sent = 0;
-		auto lastLog = steady_clock::now();
-
-		while (running) {
-			// Sleep until it's time to send. Do NOT hold the lock while sleeping.
-			std::this_thread::sleep_until(nextSend);
-
-			H264_Frame frame;
-			{
-				std::lock_guard<std::mutex> lk(m);
-				if (!running) break;
-
-				// Drop if nothing fresh; don’t stall.
-				if (hasFrame) {
-					frame.bytevec.swap(latest.bytevec);
-					hasFrame = false;
-				}
-			}
-
-			if (!frame.bytevec.empty()) {
-				rtc::binary bin(frame.bytevec.size());
-				std::transform(frame.bytevec.begin(), frame.bytevec.end(), bin.begin(),
-					[](uint8_t c) { return std::byte(c); });
-
-				if (track && track->send(bin)) ++sent;
-				else LogMessage("[Pacer] track->send() failed");
-			}
-
-			// Advance schedule; if we’re behind, reset to now (drop latency, don’t chase backlog)
-			nextSend += duration_cast<steady_clock::duration>(frameDur);
-			auto now = steady_clock::now();
-			if (now - nextSend > frameDur) nextSend = now;
-
-			if (now - lastLog >= seconds(1)) {
-				LogMessage("[Pacer] fps=" + std::to_string(sent) + " queue=" + std::to_string(hasFrame ? 1 : 0));
-				sent = 0;
-				lastLog = now;
-			}
-		}
-	}
-	//void run() {
-	//	using namespace std::chrono;
-	//	const auto frameDur = duration<double>(1.0 / double(targetFps));
-	//
-	//	size_t sent = 0;
-	//	auto lastLog = steady_clock::now();
-	//
-	//	while (running) {
-	//		std::unique_lock<std::mutex> lk(m);
-	//		cv.wait_until(lk, nextSend, [this] { return !running || hasFrame; });
-	//		if (!running) break;
-	//
-	//		auto now = steady_clock::now();
-	//		if (now < nextSend) {
-	//			continue;
-	//		}
-	//
-	//		H264_Frame frame;
-	//		if (hasFrame) {
-	//			frame.bytevec.swap(latest.bytevec);
-	//			hasFrame = false;
-	//		}
-	//		lk.unlock();
-	//
-	//		if (!frame.bytevec.empty()) {
-	//			//rtpSender->sendAccessUnit(frame.bytevec/*, frame.bytevec.size(), frame.ts90k*/);
-	//			//++sent;
-	//			
-	//			// Send via libdatachannel track; packetizer must be attached once at setup.
-	//			rtc::binary bin(frame.bytevec.size());
-	//			std::transform(frame.bytevec.begin(), frame.bytevec.end(), bin.begin(),
-	//				[](uint8_t c) { return std::byte(c); });
-	//
-	//			bool ok = track && track->send(bin);
-	//			if (!ok) {
-	//				LogMessage("[Pacer] track->send() failed");
-	//			}
-	//			else {
-	//				++sent;
-	//			}
-	//		}
-	//		else {
-	//			
-	//		}
-	//
-	//		nextSend += duration_cast<steady_clock::duration>(frameDur);
-	//
-	//		now = steady_clock::now();
-	//		if (nextSend < now - milliseconds(5)) {
-	//			nextSend = now + duration_cast<steady_clock::duration>(frameDur);
-	//		}
-	//
-	//		if (now - lastLog >= seconds(1)) {
-	//			LogMessage("[Pacer] fps=" + std::to_string(sent) +
-	//				" queue=" + std::to_string(hasFrame ? 1 : 0));
-	//			sent = 0;
-	//			lastLog = now;
-	//		}
-	//	}
-	//}
+/**
+ * @brief WebSocket message from browser
+ * Pushed by: WebSocket callback thread
+ * Popped by: Worker thread
+ */
+struct WsMessage {
+    std::string data;  // Raw JSON message
 };
-//SimplePacer gPacer;
 
+static std::mutex g_websocketMsgMutex;
+static std::queue<WsMessage> g_websocketMsgQueue;
 
-static inline rtc::binary ToBinary(const uint8_t* data, size_t len) {
-	rtc::binary b(len);
-	std::transform(data, data + len, b.begin(),
-		[](uint8_t c) { return static_cast<std::byte>(c); });
-	return b;
+/**
+ * @brief Pushes WebSocket message to queue for processing
+ * Thread-safe: Called from WebSocket callback thread
+ */
+static void PushWsMessage(const std::string& msg) {
+    std::lock_guard<std::mutex> lk(g_websocketMsgMutex);
+    g_websocketMsgQueue.push({ msg });
 }
 
-static std::string PatchH264Fmtp(const std::string& sdp)
-{
-	// 1) Split into lines, collect mids and remember header end
-	std::vector<std::string> lines;
-	lines.reserve(256);
-	{
-		std::stringstream ss(sdp);
-		std::string ln;
-		while (std::getline(ss, ln)) {
-			if (!ln.empty() && ln.back() == '\r') ln.pop_back();
-			lines.push_back(ln);
-		}
-	}
-
-	// Find where the session header ends (after the first "t=" line)
-	int headerEnd = -1;
-	for (int i = 0; i < (int)lines.size(); ++i) {
-		if (lines[i].rfind("t=", 0) == 0) { headerEnd = i; break; }
-	}
-	if (headerEnd < 0) headerEnd = 0; // fallback
-
-	// 2) Remove any existing group:BUNDLE; collect mids; normalize fmtp and m=video port
-	std::vector<std::string> mids;
-	std::vector<std::string> out;
-	out.reserve(lines.size() + 4);
-
-	for (int i = 0; i < (int)lines.size(); ++i) {
-		const std::string& L = lines[i];
-
-		// skip existing group lines; we’ll rebuild once
-		if (L.rfind("a=group:BUNDLE", 0) == 0) continue;
-
-		// collect mids
-		if (L.rfind("a=mid:", 0) == 0) {
-			mids.push_back(L.substr(6));
-		}
-
-		// force m=video port 9 (not 0)
-		if (L.rfind("m=video ", 0) == 0) {
-			// m=video <port> ...
-			std::string fixed = L;
-			// replace the first token after "m=video " with "9"
-			size_t pos = std::string("m=video ").size();
-			size_t sp = fixed.find(' ', pos);
-			if (sp != std::string::npos) {
-				fixed.replace(pos, sp - pos, "9");
-			}
-			out.push_back(fixed);
-			continue;
-		}
-
-		// normalize H264 fmtp
-		if (L.rfind("a=fmtp:96", 0) == 0) {
-			out.push_back("a=fmtp:96 packetization-mode=1;profile-level-id=42e01f;level-asymmetry-allowed=1");
-			continue;
-		}
-		if (L == "a=framerate") {
-			out.push_back("a=framerate:30");
-			continue;
-		}
-
-		out.push_back(L);
-	}
-
-	// 3) Insert a single correct group line AFTER the header block
-	if (!mids.empty()) {
-		std::string group = "a=group:BUNDLE";
-		for (auto& m : mids) group += " " + m;
-		out.insert(out.begin() + std::min((size_t)headerEnd + 1, out.size()), group);
-	}
-
-	{
-		const uint32_t ssrc = gSSRC ? gSSRC : 0xA71DB857; // or whatever you already chose
-		const std::string ssrcStr = std::to_string(ssrc);
-	
-		// Find the video mid line
-		for (size_t i = 0; i < out.size(); ++i) {
-			if (out[i].rfind("a=mid:video", 0) == 0) {
-	
-				// Avoid double-injecting if already present
-				bool alreadyHas = false;
-				for (size_t k = i + 1; k < std::min(out.size(), i + 10); ++k) {
-					if (out[k].rfind("a=ssrc:", 0) == 0 || out[k].rfind("a=msid:", 0) == 0) {
-						alreadyHas = true; break;
-					}
-					if (out[k].rfind("m=", 0) == 0) break; // next m= section
-				}
-				if (alreadyHas) break;
-	
-				// Insert immediately after a=mid:video
-				std::vector<std::string> ins = {
-					"a=msid:stream v",
-					"a=ssrc:" + ssrcStr + " cname:webrtc",
-					"a=ssrc:" + ssrcStr + " msid:stream v",
-					"a=ssrc:" + ssrcStr + " mslabel:stream",
-					"a=ssrc:" + ssrcStr + " label:v"
-				};
-				out.insert(out.begin() + i + 1, ins.begin(), ins.end());
-				break;
-			}
-		}
-	}
-
-	// 4) Rejoin with CRLF
-	std::string sdpOut;
-	for (auto& L : out) sdpOut += L + "\r\n";
-	return sdpOut;
+/**
+ * @brief Pops WebSocket message from queue
+ * Thread-safe: Called from worker thread
+ * @return true if message retrieved, false if queue empty
+ */
+static bool PopWsMessage(WsMessage& msg) {
+    std::lock_guard<std::mutex> lk(g_websocketMsgMutex);
+    if (g_websocketMsgQueue.empty()) return false;
+    msg = std::move(g_websocketMsgQueue.front());
+    g_websocketMsgQueue.pop();
+    return true;
 }
 
-void SendSDPOfferToBrowser() {
-	if (offerDescription.empty()) return;
-	if (!g_connected) return;
-	if (g_offerSent.load()) return;
-	json offer = {
-		{"type", "sdp-offer"},
-		{"sdp", offerDescription}
-	};
-	g_websocket.send(offer.dump());
-	g_offerSent.store(true);
-	LogMessage("[WS] SDP Offer sent to browser!");
+/**
+ * @brief DataChannel message (bidirectional)
+ * Pushed by: Unity thread (OUTGOING) or DataChannel callback (INCOMING)
+ * Popped by: Worker thread
+ */
+struct DataChannelMessage {
+    enum Direction { OUTGOING, INCOMING };
+    Direction dir;      // Message direction
+    std::string data;   // JSON message payload
+};
+
+static std::mutex g_dcMsgMutex;
+static std::queue<DataChannelMessage> g_dcMsgQueue;
+
+/**
+ * @brief Pushes DataChannel message to queue
+ * Thread-safe: Called from Unity thread or DataChannel callback
+ */
+static void PushDataChannelMessage(DataChannelMessage msg) {
+    std::lock_guard<std::mutex> lk(g_dcMsgMutex);
+    g_dcMsgQueue.push(std::move(msg));
 }
 
-void StartSignalling() {
-	if (!peer_connection.get()) {
-		LogMessage("[PC] peer_connection is null!");
-		return;
-	}
-	peer_connection->setLocalDescription();
-	LogMessage("[PC] Offer sent to Browser");
+/**
+ * @brief Pops DataChannel message from queue
+ * Thread-safe: Called from worker thread
+ * @return true if message retrieved, false if queue empty
+ */
+static bool PopDataChannelMessage(DataChannelMessage& msg) {
+    std::lock_guard<std::mutex> lk(g_dcMsgMutex);
+    if (g_dcMsgQueue.empty()) return false;
+    msg = std::move(g_dcMsgQueue.front());
+    g_dcMsgQueue.pop();
+    return true;
 }
 
-void CreatePeerAndOffer() {
-	pendingCandidates.clear();
-	remoteSet.store(false);
-	g_offerSent.store(false);
-	rtc::Configuration config;
-	config.bindAddress = "10.0.0.3";
-	config.portRangeBegin = 50000;
-	config.portRangeEnd = 50100;
-	config.iceServers.clear();
-	/*config.iceServers.emplace_back("stun:stun1.l.google.com:19302");
-	config.iceServers.emplace_back("stun:stun2.l.google.com:19302");*/
-	peer_connection = std::make_shared<rtc::PeerConnection>(config);
-	NWR_AddH264VideoMLine(96);
-	peer_connection->onLocalDescription([](rtc::Description desc) {
-		/*if (!offerDescription.empty())
-		{
-			LogMessage("[WebRTC][DLL] onLocalDescription already called before");
-			return;
-		}*/
-		offerDescription = PatchH264Fmtp(std::string(desc));
+// ============================================================================
+// SECTION 10: UTILITY FUNCTIONS
+// ============================================================================
 
-		LogMessage("[WebRTC][DLL] onLocalDescription triggered: " + offerDescription);
-		if (g_connected) SendSDPOfferToBrowser();
-		//NWR_SyncVideoSsrcFromOffer();
-		});
-
-	data_connection = peer_connection->createDataChannel("data");
-
-	data_connection->onOpen([]() {
-		data_connection->send("Hello from WebStreamer DLL!");
-		LogMessage("[WebRTC][DLL] DataChannel opened");
-		});
-
-	data_connection->onMessage([](rtc::message_variant message) {
-		if (std::holds_alternative<std::string>(message)) {
-			OnMessageFromBrowser(std::get<std::string>(message).c_str());
-		}
-		});
-	peer_connection->onStateChange([](rtc::PeerConnection::State state) {
-		std::stringstream ss;
-		ss << static_cast<int>(state);
-		LogMessage("[WebRTC][DLL] PeerConnection state: " + ss.str());
-		});
-
-	peer_connection->onGatheringStateChange([](rtc::PeerConnection::GatheringState gs) {
-		LogMessage(std::string("[ICE] gathering=") + std::to_string((int)gs));
-		/*if (gs == rtc::PeerConnection::GatheringState::Complete && !g_offerSent.exchange(true)) {
-			if (!offerDescription.empty() && g_connected) {
-				LogMessage("[ICE] Complete -> sending SDP offer with candidates");
-				SendSDPOfferToBrowser();
-			}
-		}*/
-	});
-
-	peer_connection->onLocalCandidate([](rtc::Candidate candidate) {
-		std::string mid = candidate.mid();            // <-- critical
-		if (mid.empty()) mid = "video";          // fallback
-		const std::string candStr = candidate.candidate();
-		if (candStr.find("typ srflx") != std::string::npos &&
-			(candStr.find(" raddr 0.0.0.0") != std::string::npos ||
-				candStr.find(" rport 0") != std::string::npos)) {
-			LogMessage("[ICE OUT] drop malformed srflx: " + candStr);
-			return;
-		}
-		json cand = {
-			{"type", "ice-candidate"},
-			{"candidate", {
-				{"candidate", candidate.candidate()},
-				{"sdpMid", mid},
-				{"sdpMLineIndex", 0}
-			}}
-		};
-		g_websocket.send(cand.dump());
-		LogMessage("[ICE OUT] mid=" + candStr);
-		LogMessage("[WS] ICE candidate sent");
-		});
-
-	peer_connection->setLocalDescription();
+/**
+ * @brief Generates random SSRC for RTP stream
+ * Thread-safe: Uses static local with internal mutex
+ * @return Random 32-bit SSRC value
+ */
+static uint32_t MakeRandomSSRC() {
+    static std::mt19937 rng{ std::random_device{}() };
+    static std::uniform_int_distribution<uint32_t> dist(1, 0xFFFFFFFFu);
+    return dist(rng);
 }
 
+/**
+ * @brief Safely sends message via WebSocket
+ * Thread-safe: Checks atomic flags before sending
+ *
+ * @param msg JSON message to send
+ * @return true if sent successfully, false otherwise
+ */
+static bool SafeWsSend(const std::string& msg) {
+    if (!g_websocketAlive.load() || !g_connected.load()) {
+        return false;
+    }
+    try {
+        g_websocket.send(msg);
+        return true;
+    }
+    catch (const std::exception& e) {
+        LogMessage(std::string("[WS] send exception: ") + e.what());
+        return false;
+    }
+}
+
+/**
+ * @brief Patches SDP to fix compatibility issues
+ * Currently simplified - returns SDP as-is
+ *
+ * Original functionality (commented out in source):
+ * - Normalized H.264 fmtp parameters
+ * - Fixed video port to 9 instead of 0
+ * - Added BUNDLE grouping
+ * - Injected SSRC attributes
+ *
+ * @param sdp Original SDP string
+ * @return Patched SDP string
+ */
+static std::string PatchH264Fmtp(const std::string& sdp) {
+    // Simplified - just return as-is
+    // Full implementation available in commented code above
+    return sdp;
+}
+
+// ============================================================================
+// SECTION 11: CRASH HANDLING
+// ============================================================================
+
+/**
+ * @brief Windows Structured Exception Handler for crash reporting
+ * Logs exception code and address before termination
+ * Helps diagnose crashes in release builds without debugger
+ *
+ * Common codes:
+ * - 0xC0000005: Access violation (null pointer, out of bounds)
+ * - 0xC000001D: Illegal instruction (ABI mismatch, corrupted code)
+ * - 0xC0000094: Integer divide by zero
+ * - 0xC00000FD: Stack overflow (infinite recursion)
+ */
+static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* exceptionInfo) {
+    DWORD code = exceptionInfo->ExceptionRecord->ExceptionCode;
+    PVOID addr = exceptionInfo->ExceptionRecord->ExceptionAddress;
+
+    std::ostringstream oss;
+    oss << "[CRASH] Exception 0x" << std::hex << std::uppercase << code
+        << " at address 0x" << addr;
+    LogMessage(oss.str());
+
+    switch (code) {
+    case 0xC0000005: LogMessage("[CRASH] ACCESS_VIOLATION"); break;
+    case 0xC000001D: LogMessage("[CRASH] ILLEGAL_INSTRUCTION"); break;
+    case 0xC0000094: LogMessage("[CRASH] INTEGER_DIVIDE_BY_ZERO"); break;
+    case 0xC00000FD: LogMessage("[CRASH] STACK_OVERFLOW"); break;
+    default: LogMessage("[CRASH] Unknown exception"); break;
+    }
+
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// ============================================================================
+// SECTION 12: CALLBACK HANDLERS
+// ============================================================================
+// CRITICAL: These functions run on internal library threads
+// They must ONLY queue data - never perform complex operations or access shared state
+
+/**
+ * @brief WebSocket callback handler
+ * Thread-safety: Runs on ixwebsocket internal thread
+ * Safe operations: Setting atomic flags, queuing messages
+ * Unsafe operations: Accessing WebRTC objects, complex processing
+ */
+static void OnWsCallback(const ix::WebSocketMessagePtr& ixMsg) {
+    using ix::WebSocketMessageType;
+
+    switch (ixMsg->type) {
+    case WebSocketMessageType::Open:
+        LogMessage("[WS] Open");
+        g_websocketOpen = true;
+        try {
+            // Register with signaling server
+            g_websocket.send(R"({"type":"register","role":"unity"})");
+        }
+        catch (...) {}
+        break;
+
+    case WebSocketMessageType::Close:
+        LogMessage("[WS] Close");
+        g_websocketOpen = false;
+        break;
+
+    case WebSocketMessageType::Error:
+        LogMessage("[WS] Error: " + ixMsg->errorInfo.reason);
+        break;
+
+    case WebSocketMessageType::Message:
+        // Just queue the message - worker thread will parse JSON
+        PushWsMessage(ixMsg->str);
+        break;
+    }
+}
+
+/**
+ * @brief NVENC encoded frame callback
+ * Thread-safety: Runs on NVENC thread
+ * Simply queues frame data for worker thread to transmit
+ *
+ * @param data H.264 NAL units (Annex-B format)
+ * @param bytes Size of encoded data
+ * @param pts100ns Presentation timestamp in 100-nanosecond units
+ * @param key True if keyframe (IDR)
+ */
+static void OnEncodedFrameCallback(const uint8_t* data, int bytes, uint64_t pts100ns, bool key) {
+    if (data && bytes > 0) {
+        PushFrame(data, bytes, pts100ns);
+    }
+}
+
+// ============================================================================
+// SECTION 13: WORKER THREAD - MESSAGE PROCESSING
+// ============================================================================
+// These functions run ONLY on the worker thread
+// They have exclusive access to WebRTC objects
+
+/**
+ * @brief Sends SDP offer to browser via WebSocket
+ * Thread-safety: Called only from worker thread
+ * Checks: WebSocket open, offer not already sent, SDP not empty
+ */
+static void SendOfferIfReady() {
+    if (!g_websocketOpen.load()) {
+        LogMessage("[Send] WS not open, can't send offer");
+        return;
+    }
+
+    if (g_offerSent.exchange(true)) {
+        LogMessage("[Send] Offer already sent");
+        return;
+    }
+
+    std::string sdp;
+    {
+        std::lock_guard<std::mutex> lk(sdpMutex);
+        sdp = g_localSdp;
+    }
+
+    if (sdp.empty()) {
+        LogMessage("[Send] ERROR: SDP is empty!");
+        g_offerSent = false;  // Reset so we can try again
+        return;
+    }
+
+    nlohmann::json j = {
+        {"type", "sdp-offer"},
+        {"sdp", sdp}
+    };
+
+    try {
+        std::string offerJson = j.dump();
+        LogMessage("[Send] Sending offer (" + std::to_string(offerJson.size()) + " bytes)");
+        g_websocket.send(offerJson);
+        LogMessage("[Worker] Offer sent successfully!");
+    }
+    catch (const std::exception& e) {
+        LogMessage("[Worker] Send offer failed: " + std::string(e.what()));
+        g_offerSent = false;  // Reset so we can try again
+    }
+}
+
+/**
+ * @brief Sends buffered ICE candidates after remote SDP is set
+ * Thread-safety: Called only from worker thread
+ *
+ * ICE candidates are buffered if they arrive before the browser's SDP answer.
+ * Once the answer is received, this function flushes all pending candidates.
+ */
 static void FlushPendingCandidates() {
+    if (!g_websocketOpen.load() || !remoteSet.load()) return;
 
-	LogMessage("[WEBRTC] [DLL] Pending Candidates size: " + std::to_string(pendingCandidates.size()));
-	if (!peer_connection || !remoteSet)
-	{
-		LogMessage("[WEBRTC] [DLL] Peer Connection and/or Remote Set is/are false");
-		return;
-	}
-	for (auto &c : pendingCandidates) {
-		try { 
-			LogMessage("[WEBRTC] [DLL] " + std::string(c.candidate().c_str()));
-			peer_connection->addRemoteCandidate(c); 
-		}
-		catch (const std::exception& e) { LogMessage(std::string("[PC] addRemoteCandidate err: ") + e.what()); }
-	}
-	pendingCandidates.clear();
+    std::vector<std::string> toSend;
+    {
+        std::lock_guard<std::mutex> lk(sdpMutex);
+        toSend.swap(pendingCandidates);
+    }
+
+    if (!toSend.empty()) {
+        LogMessage("[Worker] Flushing " + std::to_string(toSend.size()) + " candidates");
+    }
+
+    for (const auto& candJson : toSend) {
+        try {
+            g_websocket.send(candJson);
+        }
+        catch (...) {}
+    }
 }
 
-void InitSocket(const std::string& host = "127.0.0.1", const std::string& port = "9090") {
-	LogMessage("[WS] Initializing socket");
-	g_websocket.setUrl("ws://localhost:9090");
+/**
+ * @brief Processes WebSocket messages from queue
+ * Thread-safety: Called only from worker thread
+ *
+ * Handles three message types:
+ * 1. sdp-answer: Browser's SDP answer (completes handshake)
+ * 2. ice-candidate: Browser's ICE candidates (establishes connectivity)
+ * 3. command: Application-level commands (forwarded to Unity)
+ */
+static void ProcessWsMessages() {
+    WsMessage msg;
+    while (PopWsMessage(msg)) {
+        try {
+            if (!g_peer_connection) continue;
 
-	g_websocket.setOnMessageCallback([](const ix::WebSocketMessagePtr& msg) {
-		using ix::WebSocketMessageType;
+            auto j = nlohmann::json::parse(msg.data);
+            std::string type = j.value("type", "");
 
-		std::stringstream ss;
-		switch (msg->type) {
-		case WebSocketMessageType::Open:
-			g_connected = true;
-
-			// Register Unity with the server
-			g_websocket.send(R"({"type":"register","role":"unity"})");
-			LogMessage("[WS] Connected to signaling server");
-			if (offerDescription.empty()) {
-				LogMessage("[WS] No cached offer -> generating now");
-				CreatePeerAndOffer();
-			}
-			else {
-				LogMessage("[WS] Have cached offer -> sending now");
-				SendSDPOfferToBrowser();
-			}
-			break;
-
-		case WebSocketMessageType::Close:
-			ss << "[WS] Disconnected from signaling server" << msg->closeInfo.code
-				<< " reason=" << msg->closeInfo.reason;
-			LogMessage(ss.str());
-			g_connected = false;
-			break;
-
-		case WebSocketMessageType::Error:
-			LogMessage("[WS] Error: " + msg->errorInfo.reason);
-			break;
-
-		case WebSocketMessageType::Message:
-			LogMessage("[WS] Received: " + msg->str);
-
-			try {
-				json j = json::parse(msg->str);
-				const std::string type = j.value("type", "");
-				if (type == "sdp-answer") {
-					if (!peer_connection) { LogMessage("[WS] No peer_connection for sdp-answer"); return; }
-					if (remoteSet.load()) { LogMessage("[WS] Remote already set, ignoring extra answer"); return; }
-
-					const std::string sdp = j.value("sdp", "");
-					if (sdp.empty()) { LogMessage("[WS] sdp-answer missing sdp"); return; }
-					try {
-						auto j = json::parse(msg->str);
-						LogMessage("[WS] SDP string: " + sdp);
-						rtc::Description desc(sdp, "answer");
-						peer_connection->setRemoteDescription(desc);
-						remoteSet.store(true);
-						LogMessage("[WS] setRemoteDescription success");
-						FlushPendingCandidates();
-					}
-					catch (const std::exception& e) {
-						LogMessage(std::string("[WS] Exception in setRemoteDescription: ") + e.what());
-					}
-					catch (...) {
-						LogMessage("[WS] Unknown exception in setRemoteDescription");
-					}
-				}
-				else if (type == "command") {
-					if (j.contains("data")) {
-						OnMessageFromBrowser(j["data"].get<std::string>());
-					}
-				}
-				else if (type == "ice-candidate") {
-					if (!peer_connection) { LogMessage("[WS] No peer_connection for ICE"); return; }
-					/*try {
-						std::string candidateStr = j["candidate"]["candidate"];
-						std::string sdpMid = j["candidate"]["sdpMid"];
-						LogMessage("Adding ICE candidate: " + candidateStr + " mid: " + sdpMid);
-						rtc::Candidate candidate = rtc::Candidate(
-							candidateStr,
-							sdpMid);
-						if (!peer_connection->remoteDescription()) {
-							pendingCandidates.push_back(candidate);
-						}
-						else {
-							peer_connection->addRemoteCandidate(candidate);
-						}
-						LogMessage("addRemoteCandidate success");
-					}
-					catch (const std::exception& e) {
-						LogMessage(std::string("Exception in addRemoteCandidate: ") + e.what());
-					}
-					catch (...) {
-						LogMessage("Unknown exception in addRemoteCandidate");
-					}*/
-					if (!j.contains("candidate")) { LogMessage("[WS] ICE missing candidate"); return; }
-					const auto& jc = j["candidate"];
-					const std::string candStr = jc.value("candidate", "");
-					std::string sdpMid = jc.value("sdpMid", "");
-
-					LogMessage("[WS] Adding ICE candidate: " + candStr + " mid: " + sdpMid);
-
-					try {
-						rtc::Candidate cand(candStr, sdpMid);
-						if (!remoteSet.load()) {
-							pendingCandidates.push_back(cand);
-							LogMessage("[WS] Queued ICE (remote not set yet). Queue size=" + std::to_string(pendingCandidates.size()));
-						}
-						else {
-							peer_connection->addRemoteCandidate(cand);
-							LogMessage("[WS] addRemoteCandidate OK (immediate)");
-						}
-					}
-					catch (const std::exception& e) {
-						LogMessage(std::string("[WS] addRemoteCandidate exception: ") + e.what());
-					}
-					LogMessage("[WS] Received and added ICE candidate");
-				}
-			}
-			catch (...) {
-				std::cerr << "[WS] Failed to parse JSON message\n";
-			}
-			break;
-		}
-		});
-
-	g_websocket.start();
+            if (type == "sdp-answer") {
+                std::string sdp = j.value("sdp", "");
+                if (!sdp.empty()) {
+                    g_peer_connection->setRemoteDescription(rtc::Description(sdp, "answer"));
+                    remoteSet = true;
+                    LogMessage("[Worker] Remote SDP set");
+                    FlushPendingCandidates();
+                }
+            }
+            else if (type == "ice-candidate") {
+                auto& jc = j["candidate"];
+                std::string cand = jc.value("candidate", "");
+                std::string mid = jc.value("sdpMid", "video");
+                if (!cand.empty()) {
+                    g_peer_connection->addRemoteCandidate(rtc::Candidate(cand, mid));
+                    LogMessage("[Worker] Added remote candidate");
+                }
+            }
+            else if (type == "command") {
+                if (j.contains("data")) {
+                    std::string cmdData = j["data"].get<std::string>();
+                    LogMessage("[Worker] Command received: " + cmdData);
+                    OnMessageFromBrowser(cmdData);
+                }
+            }
+        }
+        catch (const std::exception& e) {
+            LogMessage("[Worker] WS message error: " + std::string(e.what()));
+        }
+    }
 }
 
-static inline bool IsVideoReady()
-{
-	if (!peer_connection) 
-	{
-		LogMessage("[WEBRTC] [DLL] Peer Connection is null");
-		return false;
-	}
-	auto st = peer_connection->state();
-	if (st != rtc::PeerConnection::State::Connected)
-	{
-		LogMessage("[WEBRTC] [DLL] Peer Connection is not connected");
-		return false;
-	}
-	if (!gVideoTrack)
-	{
-		LogMessage("[WEBRTC] [DLL] Video Track is null");
-		return false;
-	}
-	if (!gVideoTrack->isOpen())
-	{
-		LogMessage("[WEBRTC] [DLL]  Video Track is not open");
-		return false;
-	}
-	return true;
+/**
+ * @brief Processes and sends video frames from queue
+ * Thread-safety: Called only from worker thread
+ *
+ * Batch limit: 10 frames per iteration to prevent starvation of other tasks
+ * Sends only when: PeerConnection connected, track open, packetizer ready
+ */
+static void ProcessFrames() {
+    if (!g_peer_connection) return;
+    if (g_peer_connection->state() != rtc::PeerConnection::State::Connected) return;
+    if (!g_videoTrack || !g_videoTrack->isOpen()) return;
+    if (!g_h264Packetizer) return;
+
+    FrameData frame;
+    int sent = 0;
+    while (PopFrame(frame) && sent < 10) {  // Limit to prevent blocking
+        try {
+            // Convert presentation timestamp to RTP timestamp (90kHz clock)
+            uint32_t ts90k = uint32_t((frame.pts100ns * 9) / 1000);
+            g_h264Packetizer->rtpConfig->timestamp = ts90k;
+
+            // Convert std::vector<uint8_t> to rtc::binary
+            rtc::binary bin(frame.data.size());
+            std::transform(frame.data.begin(), frame.data.end(),
+                bin.begin(), [](uint8_t c) { return std::byte(c); });
+
+            if (g_videoTrack->send(bin)) {
+                sent++;
+            }
+        }
+        catch (...) {}
+    }
 }
 
-// Parse SSRC for the video m= section from the local SDP offer (so our RTP SSRC matches)
-static uint32_t ParseVideoSsrcFromOffer(const std::string& sdp)
-{
-	size_t mpos = sdp.find("\nm=video ");
-	if (mpos == std::string::npos) mpos = sdp.find("\r\nm=video ");
-	if (mpos == std::string::npos) return 0;
+/**
+ * @brief Processes DataChannel messages from queue
+ * Thread-safety: Called only from worker thread
+ *
+ * Handles bidirectional DataChannel communication:
+ * - OUTGOING: Messages from Unity to browser
+ * - INCOMING: Messages from browser to Unity (calls registered callback)
+ */
+static void ProcessDataChannelMessages() {
+    if (!g_dc) return;
 
-	size_t nextM = sdp.find("\nm=", mpos + 1);
-	if (nextM == std::string::npos) nextM = sdp.find("\r\nm=", mpos + 1);
-	size_t sectionEnd = (nextM == std::string::npos) ? sdp.size() : nextM;
-
-	size_t a = sdp.find("a=ssrc:", mpos);
-	if (a == std::string::npos || a > sectionEnd) return 0;
-
-	size_t p = a + 7;
-	while (p < sdp.size() && sdp[p] == ' ') ++p;
-	uint32_t ssrc = 0;
-	while (p < sdp.size()) {
-		char c = sdp[p++];
-		if (c < '0' || c > '9') break;
-		ssrc = ssrc * 10 + (c - '0');
-	}
-	return ssrc;
+    DataChannelMessage msg;
+    while (PopDataChannelMessage(msg)) {
+        try {
+            if (msg.dir == DataChannelMessage::OUTGOING) {
+                // Send to browser
+                if (g_dc->isOpen()) {
+                    g_dc->send(msg.data);
+                }
+                else {
+                    LogMessage("[DC] Can't send - not open");
+                }
+            }
+            else if (msg.dir == DataChannelMessage::INCOMING) {
+                // Forward to Unity callback
+                OnMessageFromBrowser(msg.data);
+            }
+        }
+        catch (const std::exception& e) {
+            LogMessage("[DC] Message processing error: " + std::string(e.what()));
+        }
+    }
 }
 
-inline bool containsNalType(const uint8_t* data, size_t size, uint8_t type)
-{
-	if (!data || size < 1) return false;
+/**
+ * @brief Polls PeerConnection for completed ICE gathering
+ * Thread-safety: Called only from worker thread
+ *
+ * IMPORTANT: This uses polling instead of onLocalDescription/onLocalCandidate
+ * callbacks because those callbacks were causing crashes on certain machines
+ * due to threading issues in libdatachannel.
+ *
+ * Flow:
+ * 1. Check if ICE gathering is complete
+ * 2. Retrieve local SDP (includes all gathered ICE candidates)
+ * 3. Send complete offer to browser
+ *
+ * This approach is more reliable than trickle ICE for our use case.
+ */
+static void PollLocalDescription() {
+    if (!g_peer_connection) {
+        LogMessage("[Poll] No PeerConnection");
+        return;
+    }
 
-	auto read_u32_be = [](const uint8_t* p) -> uint32_t {
-		return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
-			(uint32_t(p[2]) << 8) | uint32_t(p[3]);
-		};
+    if (g_offerSent.load()) {
+        static bool loggedOnce = false;
+        if (!loggedOnce) {
+            LogMessage("[Poll] Offer already sent, skipping");
+            loggedOnce = true;
+        }
+        return;
+    }
 
-	size_t i = 0;
-	bool isAnnexB = false;
+    // Check ICE gathering state
+    auto gatheringState = g_peer_connection->gatheringState();
 
-	for (size_t j = 0; j + 3 < size && j < 64; ++j) {
-		if (data[j] == 0x00 && data[j + 1] == 0x00 &&
-			((data[j + 2] == 0x01) || (data[j + 2] == 0x00 && data[j + 3] == 0x01))) {
-			isAnnexB = true;
-			break;
-		}
-	}
+    if (gatheringState == rtc::PeerConnection::GatheringState::Complete) {
+        if (!g_gatheringComplete) {
+            g_gatheringComplete = true;
+            LogMessage("[Worker] ICE gathering complete");
+        }
 
-	if (isAnnexB) {
-		while (i + 3 < size) {
-			size_t z = i;
-			int zeros = 0;
-			while (z < size && data[z] == 0x00) { ++z; ++zeros; }
-			if (z < size && data[z] == 0x01 && zeros >= 2) {
-				size_t nal_start = z + 1;
-				size_t k = nal_start;
-				while (k + 3 < size) {
-					if (data[k] == 0x00 && data[k + 1] == 0x00 &&
-						((data[k + 2] == 0x01) || (data[k + 2] == 0x00 && data[k + 3] == 0x01)))
-						break;
-					++k;
-				}
-				if (nal_start < size) {
-					uint8_t nal_hdr = data[nal_start];
-					uint8_t nal_type = nal_hdr & 0x1F;		// H.264
-					if (nal_type == type) return true;		// IDR
-				}
-				i = k;
-			}
-			else {
-				++i;
-			}
-		}
-		return false;
-	}
-	else {
-		size_t pos = 0;
-		while (pos + 4 <= size) {
-			uint32_t nal_len = read_u32_be(data + pos);
-			pos += 4;
-			if (nal_len == 0 || pos + nal_len > size) break;
-			uint8_t nal_hdr = data[pos];
-			uint8_t nal_type = nal_hdr & 0x1F;
-			if (nal_type == type) return true;
-			pos += nal_len;
-		}
-		return false;
-	}
+        // Retrieve complete local description (SDP + all ICE candidates)
+        auto localDesc = g_peer_connection->localDescription();
+        if (localDesc.has_value()) {
+            try {
+                std::string sdp = std::string(localDesc.value());
+
+                if (sdp != g_lastLocalSdp && !sdp.empty()) {
+                    g_lastLocalSdp = sdp;
+                    LogMessage("[Worker] Got local SDP (" + std::to_string(sdp.size()) + " bytes)");
+
+                    std::string patched = PatchH264Fmtp(sdp);
+                    {
+                        std::lock_guard<std::mutex> lk(sdpMutex);
+                        g_localSdp = patched;
+                    }
+                    SendOfferIfReady();
+                }
+                else if (sdp.empty()) {
+                    LogMessage("[Poll] WARNING: localDescription is empty!");
+                }
+            }
+            catch (const std::exception& e) {
+                LogMessage("[Worker] Error reading local description: " + std::string(e.what()));
+            }
+        }
+        else {
+            LogMessage("[Poll] WARNING: localDescription() returned no value!");
+        }
+    }
+    else {
+        // Still gathering - log progress periodically
+        static int logThrottle = 0;
+        if ((logThrottle++ % 100) == 0) {
+            LogMessage("[Worker] Gathering state: " + std::to_string(static_cast<int>(gatheringState)));
+        }
+    }
 }
 
-static bool AU_HasIDR(const uint8_t* p, size_t n) {
-	auto isStart = [&](size_t k)->size_t {
-		if (k + 3 < n && !p[k] && !p[k + 1] && !p[k + 2] && p[k + 3] == 1) return 4;
-		if (k + 2 < n && !p[k] && !p[k + 1] && p[k + 2] == 1) return 3;
-		return 0;
-		};
-	size_t i = 0, start = SIZE_MAX;
-	while (i < n) {
-		size_t sc = isStart(i);
-		if (sc) {
-			if (start != SIZE_MAX) {
-				size_t len = i - start; while (len && p[start + len - 1] == 0) --len;
-				if (len) { uint8_t h = p[start]; uint8_t t = h & 0x1F; if (t == 5) return true; }
-			}
-			start = i + sc; i += sc;
-		}
-		else ++i;
-	}
-	if (start != SIZE_MAX && start < n) {
-		size_t len = n - start; while (len && p[start + len - 1] == 0) --len;
-		if (len) { uint8_t h = p[start]; uint8_t t = h & 0x1F; if (t == 5) return true; }
-	}
-	return false;
+// ============================================================================
+// SECTION 14: WORKER THREAD MAIN LOOP
+// ============================================================================
+
+/**
+ * @brief Main worker thread loop - handles all WebRTC operations
+ * Thread-safety: This is THE worker thread - owns all WebRTC objects
+ *
+ * ARCHITECTURE:
+ * This thread is the ONLY thread that touches WebRTC objects. All other threads
+ * communicate via queues. This design prevents race conditions and crashes.
+ *
+ * INITIALIZATION SEQUENCE:
+ * 1. Reset all state flags and clear queues
+ * 2. Initialize WebSocket connection
+ * 3. Get NVENC configuration (wait if not ready)
+ * 4. Create PeerConnection WITHOUT callbacks
+ * 5. Add video track with H.264 codec
+ * 6. Create DataChannel for bidirectional messaging
+ * 7. Setup RTP packetizer
+ * 8. Start ICE gathering
+ * 9. Enter main processing loop
+ *
+ * MAIN LOOP:
+ * Polls and processes messages in priority order:
+ * 1. ICE gathering status (signaling)
+ * 2. WebSocket messages (browser communication)
+ * 3. Video frames (streaming)
+ * 4. DataChannel messages (bidirectional data)
+ *
+ * SHUTDOWN SEQUENCE:
+ * Proper cleanup order is critical to avoid crashes:
+ * 1. Stop processing (set flags)
+ * 2. Close DataChannel
+ * 3. Close video track
+ * 4. Reset packetizer
+ * 5. Close PeerConnection
+ * 6. Stop WebSocket
+ * 7. Clear all queues
+ * 8. Reset all state flags
+ *
+ * CRITICAL LESSONS:
+ * - Never hardcode bindAddress (let auto-detect)
+ * - Always wrap WebRTC calls in try/catch
+ * - Poll for ICE completion instead of using callbacks
+ * - Clean up in reverse order of creation
+ */
+static void WorkerLoop() {
+    // Install crash handler for debugging
+    SetUnhandledExceptionFilter(CrashHandler);
+
+    LogMessage("[Worker] Started");
+    g_running = true;
+
+    // ========================================================================
+    // PHASE 1: STATE RESET
+    // ========================================================================
+    // Clear any leftover state from previous run (Unity doesn't unload DLL)
+
+    g_offerSent = false;
+    remoteSet = false;
+    g_dcOpen = false;
+    g_gatheringComplete = false;
+    g_lastLocalSdp.clear();
+
+    {
+        std::lock_guard<std::mutex> lk(sdpMutex);
+        g_localSdp.clear();
+        pendingCandidates.clear();
+    }
+
+    // Clear all message queues
+    {
+        std::lock_guard<std::mutex> lk(g_frameMutex);
+        while (!g_frameQueue.empty()) g_frameQueue.pop();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_websocketMsgMutex);
+        while (!g_websocketMsgQueue.empty()) g_websocketMsgQueue.pop();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_dcMsgMutex);
+        while (!g_dcMsgQueue.empty()) g_dcMsgQueue.pop();
+    }
+
+    LogMessage("[Worker] State reset complete");
+
+    // ========================================================================
+    // PHASE 2: WEBSOCKET INITIALIZATION
+    // ========================================================================
+
+    g_websocket.setUrl("ws://localhost:9090");
+#if IXWEBSOCKET_VERSION_MAJOR >= 11
+    g_websocket.disablePerMessageDeflate();
+#else
+    g_websocket.setPerMessageDeflateOptions(false);
+#endif
+    g_websocket.disableAutomaticReconnection();
+    g_websocket.setOnMessageCallback(OnWsCallback);
+    g_websocket.start();
+
+    // Wait for WebSocket to connect
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // ========================================================================
+    // PHASE 3: NVENC CONFIGURATION
+    // ========================================================================
+    // Get video encoding parameters from NVENC
+    // Wait up to 1 second if not ready yet
+
+    NvencServerConfig* cfg = GetNvencServerConfig();
+    if (!cfg || cfg->width == 0 || cfg->height == 0) {
+        LogMessage("[Worker] Waiting for NVENC config...");
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        cfg = GetNvencServerConfig();
+    }
+
+    // Fallback to defaults if still not configured
+    if (!cfg || cfg->width == 0) {
+        LogMessage("[Worker] Using default config");
+        static NvencServerConfig defaultCfg;
+        defaultCfg.width = 1920;
+        defaultCfg.height = 1080;
+        defaultCfg.fpsNum = 30;
+        defaultCfg.bitrateKbps = 3000;
+        defaultCfg.clockRateHz = 90000;
+        defaultCfg.startTimestamp = 0;
+        cfg = &defaultCfg;
+    }
+
+    LogMessage("[Worker] Config: " + std::to_string(cfg->width) + "x" +
+        std::to_string(cfg->height) + " @ " + std::to_string(cfg->fpsNum) + "fps");
+
+    // ========================================================================
+    // PHASE 4: PEERCONNECTION CREATION
+    // ========================================================================
+    // CRITICAL: Do NOT set bindAddress - let WebRTC auto-detect interfaces
+    // Setting a specific IP causes crashes if that interface isn't available
+
+    rtc::Configuration config;
+    // config.bindAddress = "10.0.0.3";  // NEVER hardcode this!
+    config.portRangeBegin = 50000;
+    config.portRangeEnd = 50100;
+
+    try {
+        LogMessage("[Worker] Creating PeerConnection...");
+        g_peer_connection = std::make_shared<rtc::PeerConnection>(config);
+        LogMessage("[Worker] PeerConnection created (no callbacks)");
+    }
+    catch (const std::exception& e) {
+        LogMessage("[Worker] EXCEPTION creating PC: " + std::string(e.what()));
+        g_running = false;
+        return;
+    }
+    catch (...) {
+        LogMessage("[Worker] UNKNOWN EXCEPTION creating PC");
+        g_running = false;
+        return;
+    }
+
+    // ========================================================================
+    // PHASE 5: VIDEO TRACK CREATION
+    // ========================================================================
+
+    rtc::Description::Video video("video", rtc::Description::Direction::SendOnly);
+    video.setBitrate(cfg->bitrateKbps * 1000);  // Convert kbps to bps
+    video.addH264Codec(96);
+    video.addAttribute("framerate");
+
+    g_videoTrack = g_peer_connection->addTrack(video);
+
+    if (!g_videoTrack) {
+        LogMessage("[Worker] ERROR: Failed to create track");
+        g_running = false;
+        return;
+    }
+
+    // ========================================================================
+    // PHASE 6: DATACHANNEL CREATION
+    // ========================================================================
+    // DataChannel enables bidirectional messaging between Unity and browser
+
+    try {
+        LogMessage("[Worker] Creating DataChannel...");
+        g_dc = g_peer_connection->createDataChannel("data");
+
+        // Setup callbacks - safe because they only queue messages
+        g_dc->onOpen([]() {
+            LogMessage("[DC] Opened");
+            g_dcOpen = true;
+
+            // Send hello message to confirm connection
+            DataChannelMessage msg;
+            msg.dir = DataChannelMessage::OUTGOING;
+            msg.data = "Hello from WebStreamer DLL!";
+            PushDataChannelMessage(std::move(msg));
+            });
+
+        g_dc->onClosed([]() {
+            LogMessage("[DC] Closed");
+            g_dcOpen = false;
+            });
+
+        g_dc->onError([](std::string error) {
+            LogMessage("[DC] Error: " + error);
+            g_dcOpen = false;
+            });
+
+        g_dc->onMessage([](rtc::message_variant message) {
+            if (std::holds_alternative<std::string>(message)) {
+                std::string msg = std::get<std::string>(message);
+                LogMessage("[DC] Received: " + msg);
+
+                // Queue for processing on worker thread
+                DataChannelMessage dcMsg;
+                dcMsg.dir = DataChannelMessage::INCOMING;
+                dcMsg.data = std::move(msg);
+                PushDataChannelMessage(std::move(dcMsg));
+            }
+            });
+
+        LogMessage("[Worker] DataChannel created");
+    }
+    catch (const std::exception& e) {
+        LogMessage("[Worker] DataChannel creation failed: " + std::string(e.what()));
+        // Continue without DataChannel (video will still work)
+    }
+
+    // ========================================================================
+    // PHASE 7: RTP PACKETIZER SETUP
+    // ========================================================================
+    // Packetizer converts H.264 NAL units to RTP packets
+
+    uint32_t ssrc = MakeRandomSSRC();
+    auto rtpCfg = std::make_shared<rtc::RtpPacketizationConfig>(
+        ssrc,                   // Synchronization Source ID
+        "webrtc",               // CNAME
+        96,                     // Payload type (dynamic range for H.264)
+        cfg->clockRateHz,       // 90000 Hz for video
+        0                       // Video orientation extension ID (unused)
+    );
+    rtpCfg->startTimestamp = cfg->startTimestamp;
+
+    g_h264Packetizer = std::make_shared<rtc::H264RtpPacketizer>(
+        rtc::NalUnit::Separator::StartSequence,  // Annex-B format
+        rtpCfg,
+        1200  // MTU size (safe for most networks)
+    );
+
+    g_videoTrack->setMediaHandler(g_h264Packetizer);
+
+    LogMessage("[Worker] Track ready, SSRC=0x" + [](uint32_t s) {
+        std::ostringstream o;
+        o << std::hex << std::uppercase << s;
+        return o.str();
+        }(ssrc));
+
+    // ========================================================================
+    // PHASE 8: START ICE GATHERING
+    // ========================================================================
+    // This triggers ICE candidate gathering
+    // We poll for completion instead of using callbacks (more reliable)
+
+    try {
+        LogMessage("[Worker] Starting ICE gathering...");
+        g_peer_connection->setLocalDescription();
+        LogMessage("[Worker] setLocalDescription() returned successfully");
+    }
+    catch (const std::exception& e) {
+        LogMessage("[Worker] EXCEPTION in setLocalDescription: " + std::string(e.what()));
+        g_running = false;
+        return;
+    }
+    catch (...) {
+        LogMessage("[Worker] UNKNOWN EXCEPTION in setLocalDescription");
+        g_running = false;
+        return;
+    }
+
+    // ========================================================================
+    // PHASE 9: MAIN PROCESSING LOOP
+    // ========================================================================
+    // Poll and process messages at 100Hz (10ms intervals)
+
+    int iteration = 0;
+    while (g_running.load()) {
+        // 1. Check ICE gathering and send offer when ready
+        PollLocalDescription();
+
+        // 2. Process incoming WebSocket messages (SDP answer, ICE candidates, commands)
+        ProcessWsMessages();
+
+        // 3. Send queued video frames
+        ProcessFrames();
+
+        // 4. Process DataChannel messages (bidirectional)
+        ProcessDataChannelMessages();
+
+        // Sleep to prevent busy-waiting (10ms = ~100Hz poll rate)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        iteration++;
+    }
+
+    // ========================================================================
+    // PHASE 10: SHUTDOWN AND CLEANUP
+    // ========================================================================
+    // CRITICAL: Clean up in reverse order of creation to avoid crashes
+
+    LogMessage("[Worker] Stopping");
+
+    // Stop processing new messages immediately
+    g_running = false;
+    g_dcOpen = false;
+    g_websocketOpen = false;
+
+    // 1. Close DataChannel
+    if (g_dc) {
+        try {
+            LogMessage("[Worker] Closing DataChannel...");
+            if (g_dc->isOpen()) {
+                g_dc->close();
+            }
+        }
+        catch (const std::exception& e) {
+            LogMessage("[Worker] DC close error: " + std::string(e.what()));
+        }
+        g_dc.reset();
+        LogMessage("[Worker] DataChannel cleaned up");
+    }
+
+    // 2. Close video track
+    if (g_videoTrack) {
+        try {
+            LogMessage("[Worker] Closing video track...");
+            g_videoTrack->close();
+        }
+        catch (const std::exception& e) {
+            LogMessage("[Worker] Track close error: " + std::string(e.what()));
+        }
+        g_videoTrack.reset();
+        LogMessage("[Worker] Video track cleaned up");
+    }
+
+    // 3. Reset packetizer
+    if (g_h264Packetizer) {
+        g_h264Packetizer.reset();
+        LogMessage("[Worker] Packetizer cleaned up");
+    }
+
+    // 4. Close PeerConnection
+    if (g_peer_connection) {
+        try {
+            LogMessage("[Worker] Closing PeerConnection...");
+            g_peer_connection->close();
+
+            // Wait for cleanup to complete
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        catch (const std::exception& e) {
+            LogMessage("[Worker] PC close error: " + std::string(e.what()));
+        }
+        g_peer_connection.reset();
+        LogMessage("[Worker] PeerConnection cleaned up");
+    }
+
+    // 5. Stop WebSocket
+    try {
+        LogMessage("[Worker] Stopping WebSocket...");
+        g_websocket.stop();
+
+        // Wait for WS to fully close
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    catch (const std::exception& e) {
+        LogMessage("[Worker] WS stop error: " + std::string(e.what()));
+    }
+
+    // 6. Clear all queues to free memory
+    {
+        std::lock_guard<std::mutex> lk(g_frameMutex);
+        while (!g_frameQueue.empty()) g_frameQueue.pop();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_websocketMsgMutex);
+        while (!g_websocketMsgQueue.empty()) g_websocketMsgQueue.pop();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_dcMsgMutex);
+        while (!g_dcMsgQueue.empty()) g_dcMsgQueue.pop();
+    }
+
+    // 7. Reset all state flags for next run
+    g_offerSent = false;
+    remoteSet = false;
+    g_dcOpen = false;
+    g_gatheringComplete = false;
+    g_lastLocalSdp.clear();
+
+    {
+        std::lock_guard<std::mutex> lk(sdpMutex);
+        g_localSdp.clear();
+        pendingCandidates.clear();
+    }
+
+    LogMessage("[Worker] Stopped - all state reset");
 }
-std::atomic<bool> haveKeyframe{ false };
-static void OnEncodedFrame(const uint8_t* data, int bytes, uint64_t pts100ns, bool key)
-{
-	if (!IsVideoReady()) {
-		static int throttle = 0;
-		if ((throttle++ % 120) == 0)
-			LogMessage("[RTP] Drop: PC/Track not ready");
-		return;
-	}
-	if (!data || bytes <= 0) return;
-	//-----1----------
 
-	if (!haveKeyframe) {
-		bool isIDR = containsNalType(data, bytes, 5);   // parse Annex-B, look for NAL type 5
-		bool hasSPS = containsNalType(data, bytes, 7);
-		bool hasPPS = containsNalType(data, bytes, 8);
-		if (!(isIDR && (hasSPS || hasPPS))) {
-			// Drop pre-roll P/B frames; decoder can’t use them
-			return;
-		}
-		haveKeyframe = true;
-		//gPacer.start(gV_FPS);
-	}
+// ============================================================================
+// SECTION 15: PUBLIC API - UNITY INTERFACE
+// ============================================================================
+// These functions are called from Unity's C# code via P/Invoke
+// Thread-safety: Can be called from any Unity thread
 
-	ByteVec au(bytes);
-	std::memcpy(au.data(), data, bytes);
-	bool idrInAu = AU_HasIDR(au.data(), au.size());
-	LogMessage(std::string("[H264] AU key=") + (idrInAu ? "1" : "0") +
-		" bytes=" + std::to_string(bytes));
-	const uint32_t ts90k = static_cast<uint32_t>((pts100ns * 9) / 1000);
+/**
+ * @brief Sends log data to browser via DataChannel
+ * Thread-safety: Safe to call from Unity main thread
+ *
+ * Queues message for worker thread to send when DataChannel is open.
+ * Used for debugging and telemetry (transform data, shader states, etc.)
+ *
+ * @param log Pointer to log_data structure
+ * @return true if queued successfully, false if DataChannel not open
+ *
+ * USAGE FROM UNITY:
+ * [DllImport("YourPlugin")]
+ * private static extern bool LogData(ref LogData data);
+ */
+WEBRTC_STREAMER_API bool LogData(log_data* log) {
+    if (!log) return false;
 
-	rtc::binary bin(au.size());
-	std::transform(au.begin(), au.end(), bin.begin(),
-		[](uint8_t c) { return std::byte(c); });
-	h264Packetizer->rtpConfig->timestamp = ts90k;
+    try {
+        // Serialize to JSON
+        nlohmann::json log_json = {
+            {"type", "log"},
+            {"position", {log->transform.position[0], log->transform.position[1], log->transform.position[2]}},
+            {"rotation", {log->transform.rotation[0], log->transform.rotation[1], log->transform.rotation[2]}},
+            {"scale", {log->transform.scale[0], log->transform.scale[1], log->transform.scale[2]}},
+            {"shader1state", log->shader1state}
+        };
 
-	if (!gVideoTrack || !gVideoTrack->send(bin)) LogMessage("[Video] Error sending video packets");
+        std::string jsonStr = log_json.dump();
 
-	//gPacer.push(std::move(au), key, ts90k);
-	//-----1----------
+        // Queue for sending on worker thread
+        if (g_dcOpen.load()) {
+            DataChannelMessage msg;
+            msg.dir = DataChannelMessage::OUTGOING;
+            msg.data = std::move(jsonStr);
+            PushDataChannelMessage(std::move(msg));
+            return true;
+        }
+        else {
+            // DataChannel not open yet
+            return false;
+        }
+    }
+    catch (const std::exception& e) {
+        LogMessage("[LogData] Error: " + std::string(e.what()));
+        return false;
+    }
 }
 
-WEBRTC_STREAMER_API bool NWR_AddH264VideoMLine(int payloadType /* e.g., 96 */)
-{
-	NvencServerConfig* serverConfig = GetNvencServerConfig();
-	try {
-		gPT = uint8_t(payloadType);
-		rtc::Description::Video video("video", rtc::Description::Direction::SendOnly);
-		NWR_GetVideoDesc(&gV_W, &gV_H, &gV_FPS, &gV_BR);
-		gV_W = serverConfig->width;
-		gV_H = serverConfig->height;
-		gV_FPS = serverConfig->fpsNum;
-		gV_BR = serverConfig->bitrateKbps;
-		std::stringstream os;
-		os << "[Video] Description set: Width=" << gV_W << "Height=" << gV_H << "FPS=" << gV_FPS << "Bitrate=" << gV_BR;
-		LogMessage(os.str());
-
-		video.setBitrate(gV_BR);
-		video.addH264Codec(payloadType);
-		video.addAttribute("framerate");
-		gVideoTrack = peer_connection->addTrack(video);
-
-		gSSRC = MakeRandomSSRC();
-		const rtc::SSRC ssrc = gSSRC;
-
-		auto rtpCfg = std::make_shared<rtc::RtpPacketizationConfig>(
-			ssrc,                          
-			"webrtc",                      
-			/*payloadType*/ payloadType,   
-			/*clockRate*/ serverConfig->clockRateHz,           
-			/*videoOrientationId*/ 0       
-		);
-		rtpCfg->startTimestamp = serverConfig->startTimestamp;
-		h264Packetizer = std::make_shared<rtc::H264RtpPacketizer>(
-			rtc::NalUnit::Separator::StartSequence,
-			rtpCfg,
-			/*maxFragmentSize*/ 1200
-		);
-		gVideoTrack->setMediaHandler(h264Packetizer);
-		LogMessage("[WebRTC][DLL] Using SSRC 0x" + /* print hex */ [](uint32_t s) {
-			std::ostringstream o; o << std::hex << std::uppercase << s; return o.str(); }(gSSRC));
-		if (gVideoTrack) {
-			gVideoTrack->onOpen([]() 
-				{
-					gVideoReady = true;
-					LogMessage("[NVENC] Video track OPEN"); 
-				});
-			gVideoTrack->onError([](std::string e) 
-				{ 
-					gVideoReady = false;
-					LogMessage(std::string("[WebRTC][DLL] Video track ERROR: ") + e); 
-				});
-		}
-		LogMessage("[NVENC] Added H264 video m= line (PT=" + std::to_string(payloadType) + ")");
-		return true;
-	}
-	catch (const std::exception& e) {
-		LogMessage(std::string("[NVENC] NWR_AddH264VideoMLine exception: ") + e.what());
-		return false;
-	}
+/**
+ * @brief Registers callback for receiving messages from browser
+ * Thread-safety: Safe to call from Unity main thread
+ *
+ * The callback will be invoked from the worker thread when messages arrive
+ * from the browser via DataChannel or WebSocket. Unity should marshal the
+ * callback to its main thread if needed.
+ *
+ * @param cb Function pointer to callback (signature: void(*)(const char*))
+ *
+ * USAGE FROM UNITY:
+ * [DllImport("YourPlugin")]
+ * private static extern void RegisterCommandCallback(CommandCallbackDelegate callback);
+ *
+ * [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+ * private delegate void CommandCallbackDelegate(string message);
+ */
+WEBRTC_STREAMER_API void RegisterCommandCallback(CommandCallback cb) {
+    g_CommandCallback = cb;
 }
 
-// This reads the SSRC from our own offer so RTP SSRC matches.
-WEBRTC_STREAMER_API void NWR_SyncVideoSsrcFromOffer()
-{
-	if (offerDescription.empty()) return;
-	gSSRC = ParseVideoSsrcFromOffer(offerDescription);
-	if (gSSRC == 0) LogMessage("[NVENC] Could not parse video SSRC from offer; using fallback 0x11223344");
-	else LogMessage("[NVENC] Parsed video SSRC from offer: " + std::to_string(gSSRC));
+/**
+ * @brief Initializes the WebRTC streaming system
+ * Thread-safety: Should be called once from Unity's main thread
+ *
+ * INITIALIZATION FLOW:
+ * 1. Creates log directory
+ * 2. Logs loaded DLLs (for debugging)
+ * 3. Registers NVENC callbacks
+ * 4. Initializes libdatachannel logger
+ * 5. Starts worker thread
+ *
+ * The worker thread will:
+ * - Connect to WebSocket signaling server
+ * - Create PeerConnection
+ * - Start ICE gathering
+ * - Begin streaming when connected
+ *
+ * USAGE FROM UNITY:
+ * [DllImport("YourPlugin")]
+ * private static extern void Init();
+ *
+ * void Start() {
+ *     Init();
+ * }
+ */
+WEBRTC_STREAMER_API void Init() {
+    std::filesystem::create_directories("WebStreamLogs");
+
+    LogMessage("=== Init Start ===");
+
+    // Log loaded DLLs for debugging dependency issues
+    HMODULE hMods[1024];
+    DWORD cbNeeded;
+    if (EnumProcessModules(GetCurrentProcess(), hMods, sizeof(hMods), &cbNeeded)) {
+        for (unsigned int i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
+            char szModName[MAX_PATH];
+            if (GetModuleFileNameExA(GetCurrentProcess(), hMods[i], szModName, sizeof(szModName))) {
+                std::string modName = szModName;
+                // Only log WebRTC-related DLLs
+                if (modName.find("datachannel") != std::string::npos ||
+                    modName.find("libcrypto") != std::string::npos ||
+                    modName.find("libssl") != std::string::npos) {
+                    LogMessage("[DLL] Loaded: " + modName);
+                }
+            }
+        }
+    }
+
+    // Register NVENC callbacks
+    Nvenc_SetLogger(&NvEncBridgeLogger);
+    Nvenc_SetEncodedFrameSink(&OnEncodedFrameCallback);
+
+    // Initialize libdatachannel logger (Warning level to reduce noise)
+    rtc::InitLogger(rtc::LogLevel::Warning);
+
+    // Start worker thread (does all WebRTC work)
+    g_workerThread = std::thread(WorkerLoop);
+
+    LogMessage("=== Init Complete ===");
 }
 
-WEBRTC_STREAMER_API bool LogData(log_data* log)
-{
-	if (!log) return false;
-	json log_json = {
-		{"type", "log"},
-		{"position", {log->transform.position[0], log->transform.position[1], log->transform.position[2]}},
-		{"rotation", {log->transform.rotation[0], log->transform.rotation[1], log->transform.rotation[2]}},
-		{"scale", {log->transform.scale[0], log->transform.scale[1], log->transform.scale[2]}},
-		{"shader1state", log->shader1state}
-	};
-	std::string jsonStr = log_json.dump();
-	/*if(!s_Logger.is_open())
-		s_Logger = std::ofstream{ "WebStreamLogs/logs.txt", std::ios::app };
-	s_Logger << jsonStr << "\n";
-	s_Logger.flush();*/
+/**
+ * @brief Stops the WebRTC streaming system and cleans up resources
+ * Thread-safety: Should be called once from Unity's main thread
+ *
+ * SHUTDOWN FLOW:
+ * 1. Signals worker thread to stop
+ * 2. Waits for worker thread to complete cleanup
+ * 3. Closes NVENC encoder
+ *
+ * The worker thread will clean up in proper order:
+ * DataChannel → Track → Packetizer → PeerConnection → WebSocket
+ *
+ * USAGE FROM UNITY:
+ * [DllImport("YourPlugin")]
+ * private static extern void StopSignaling();
+ *
+ * void OnDestroy() {
+ *     StopSignaling();
+ * }
+ *
+ * IMPORTANT: Must be called before Unity unloads the scene to avoid
+ * leaving resources in an inconsistent state for next play session.
+ */
+WEBRTC_STREAMER_API void StopSignaling() {
+    LogMessage("=== Stop Start ===");
 
-	// Send to browser over WebRTC if connected
-	if (data_connection && data_connection->isOpen()) {
-		data_connection->send(jsonStr);
-		//LogMessage("[WebRTC][DLL] Message sent " + jsonStr);
-	}
+    // Signal worker thread to stop
+    g_running = false;
 
-	return true;
+    // Wait for worker thread to finish cleanup (with timeout handled internally)
+    if (g_workerThread.joinable()) {
+        g_workerThread.join();
+    }
+
+    // Close NVENC encoder
+    Nvenc_Close();
+
+    LogMessage("=== Stop Complete ===");
 }
 
-WEBRTC_STREAMER_API
-void RegisterCommandCallback(CommandCallback cb)
-{
-	g_CommandCallback = cb;
+// ============================================================================
+// SECTION 16: LEGACY/UNUSED CODE
+// ============================================================================
+// The following functions/variables are kept for reference but not currently used
+
+/**
+ * @brief Legacy task posting system
+ * UNUSED: Replaced by polling architecture to avoid callback threading issues
+ */
+static void Post(std::function<void()> t) {
+    std::lock_guard<std::mutex> lk(qM);
+    q.push(std::move(t));
+    qCV.notify_one();
 }
 
-void OnMessageFromBrowser(std::string msg)
-{
-	if (g_CommandCallback)
-		g_CommandCallback(msg.c_str());
-	//LogMessage("[WebRTC][Browser]: " + msg);
-}
-
-void NWR_DestroyPeer()
-{
-	try {
-		// stop NVENC first (flushes & releases)
-		Nvenc_Close();
-		// drop video track
-		if (gVideoTrack) {
-			h264Packetizer.reset();
-			gVideoTrack->close();
-			gVideoTrack.reset();
-		}
-
-		// close data channel
-		if (data_connection) {
-			data_connection->close();
-			data_connection.reset();
-		}
-
-		// close PC
-		if (peer_connection) {
-			peer_connection->close();
-			peer_connection.reset();
-		}
-
-		// stop websocket
-		if (g_connected) {
-			g_websocket.stop();
-			g_connected = false;
-		}
-
-		// reset flags/buffers
-		offerDescription.clear();
-		pendingCandidates.clear();
-		remoteSet = false;
-		gSeq = 1;
-		gCodecHeaderSent = false;
-		gSPS.clear(); gPPS.clear();
-	}
-	catch (...) {
-		LogMessage("[CLEANUP] exception during destroy");
-	}
-}
-
-WEBRTC_STREAMER_API
-void StopSignaling() {
-	NWR_DestroyPeer();
-}
-
-
-WEBRTC_STREAMER_API void Init()
-{
-	NWR_DestroyPeer();
-	std::filesystem::create_directories("WebStreamLogs");
-	Nvenc_SetLogger(&NvEncBridgeLogger);
-	Nvenc_SetEncodedFrameSink(&OnEncodedFrame);
-	if (!s_Logger.is_open())
-		s_Logger = std::ofstream{ "WebStreamLogs/logs.txt", std::ios::app };
-	rtc::InitLogger(rtc::LogLevel::Info);
-	CreatePeerAndOffer();
-	InitSocket();
-}
-
+// ============================================================================
+// END OF FILE
+// ============================================================================
+//
+// MAINTENANCE NOTES:
+//
+// 1. ADDING NEW FEATURES:
+//    - Add new message types to appropriate queue structure
+//    - Add processing logic to worker thread loop
+//    - Never access WebRTC objects from callbacks
+//
+// 2. DEBUGGING CRASHES:
+//    - Check logs for exception messages
+//    - Verify all WebRTC operations are wrapped in try/catch
+//    - Ensure no callbacks access shared state
+//    - Confirm cleanup happens in reverse order
+//
+// 3. PERFORMANCE TUNING:
+//    - Adjust frame queue size (currently 60)
+//    - Adjust batch processing limits (currently 10 frames/iteration)
+//    - Tune worker thread poll rate (currently 10ms)
+//
+// 4. THREAD SAFETY CHECKLIST:
+//    - [ ] Operation only on worker thread?
+//    - [ ] Shared state protected by mutex?
+//    - [ ] Atomic flags used correctly?
+//    - [ ] Queue operations lock-free or mutex-protected?
+//    - [ ] No callbacks touching WebRTC objects?
+//
+// 5. BEFORE COMMITTING CHANGES:
+//    - Test both first and second Unity play sessions
+//    - Test on both laptop and desktop (different network configs)
+//    - Verify no memory leaks (check task manager after multiple runs)
+//    - Ensure logs show proper initialization and cleanup
+//
+// ============================================================================

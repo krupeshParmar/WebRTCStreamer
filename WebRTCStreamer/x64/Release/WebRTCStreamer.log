@@ -1,8 +1,34 @@
-﻿  NvencD3D11.cpp
-     Creating library P:\Unity\WebRTCStreamer\x64\Release\WebRTCStreamer.lib and object P:\Unity\WebRTCStreamer\x64\Release\WebRTCStreamer.exp
+﻿  Logger.cpp
+E:\Unity\WebRTCStreamer\Logger.cpp(558,92): warning C4100: 'key': unreferenced parameter
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\xutility(476,82): warning C4244: 'argument': conversion from '_Ty' to 'uint8_t', possible loss of data
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\xutility(476,82): warning C4244:         with
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\xutility(476,82): warning C4244:         [
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\xutility(476,82): warning C4244:             _Ty=int
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\xutility(476,82): warning C4244:         ]
+  (compiling source file 'Logger.cpp')
+      C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\xutility(476,82):
+      the template instantiation context (the oldest one first) is
+          E:\Unity\WebRTCStreamer\Logger.cpp(1072,24):
+          see reference to function template instantiation 'std::shared_ptr<rtc::RtpPacketizationConfig> std::make_shared<rtc::RtpPacketizationConfig,uint32_t&,const char(&)[7],int,uint32_t&,int>(uint32_t &,const char (&)[7],int &&,uint32_t &,int &&)' being compiled
+          C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\memory(2913,46):
+          see reference to function template instantiation 'std::_Ref_count_obj2<rtc::RtpPacketizationConfig>::_Ref_count_obj2<uint32_t&,const char(&)[7],_Ty,uint32_t&,_Ty>(uint32_t &,const char (&)[7],_Ty &&,uint32_t &,_Ty &&)' being compiled
+          with
+          [
+              _Ty=int
+          ]
+          C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\memory(2100,18):
+          see reference to function template instantiation 'void std::_Construct_in_place<_Ty,uint32_t&,const char(&)[7],int,uint32_t&,int>(_Ty &,uint32_t &,const char (&)[7],int &&,uint32_t &,int &&) noexcept(false)' being compiled
+          with
+          [
+              _Ty=rtc::RtpPacketizationConfig
+          ]
+  
+E:\Unity\WebRTCStreamer\Logger.cpp(438,13): warning C4505: 'SafeWsSend': unreferenced function with internal linkage has been removed
+E:\Unity\WebRTCStreamer\Logger.cpp(1431,13): warning C4505: 'Post': unreferenced function with internal linkage has been removed
+     Creating library E:\Unity\WebRTCStreamer\x64\Release\WebRTCStreamer.lib and object E:\Unity\WebRTCStreamer\x64\Release\WebRTCStreamer.exp
   Generating code
-  57 of 2936 functions ( 1.9%) were compiled, the rest were copied from previous compilation.
-    6 functions were new in current compilation
-    90 functions had inline decision re-evaluated but remain unchanged
+  0 of 3378 functions ( 0.0%) were compiled, the rest were copied from previous compilation.
+    0 functions were new in current compilation
+    0 functions had inline decision re-evaluated but remain unchanged
   Finished generating code
-  WebRTCStreamer.vcxproj -> P:\Unity\WebRTCStreamer\x64\Release\WebRTCStreamer.dll
+  WebRTCStreamer.vcxproj -> E:\Unity\WebRTCStreamer\x64\Release\WebRTCStreamer.dll
